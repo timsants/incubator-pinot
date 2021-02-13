@@ -32,6 +32,7 @@ import org.apache.commons.configuration.PropertiesConfiguration;
 import org.apache.commons.io.FileUtils;
 import org.apache.helix.HelixManager;
 import org.apache.helix.store.zk.ZkHelixPropertyStore;
+import org.apache.pinot.common.metrics.base.PinotMetricUtilsFactory;
 import org.apache.pinot.common.metrics.ServerMetrics;
 import org.apache.pinot.common.request.InstanceRequest;
 import org.apache.pinot.common.segment.ReadMode;
@@ -57,8 +58,6 @@ import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
-
-import com.yammer.metrics.core.MetricsRegistry;
 
 
 public class QueryExecutorTest {
@@ -102,7 +101,7 @@ public class QueryExecutorTest {
     }
 
     // Mock the instance data manager
-    _serverMetrics = new ServerMetrics(new MetricsRegistry());
+    _serverMetrics = new ServerMetrics(PinotMetricUtilsFactory.getPinotMetricsRegistry());
     TableDataManagerConfig tableDataManagerConfig = mock(TableDataManagerConfig.class);
     when(tableDataManagerConfig.getTableDataManagerType()).thenReturn("OFFLINE");
     when(tableDataManagerConfig.getTableName()).thenReturn(TABLE_NAME);
