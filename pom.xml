@@ -429,6 +429,11 @@
         <artifactId>commons-io</artifactId>
         <version>2.4</version>
       </dependency>
+      <dependency>
+        <groupId>net.snowflake</groupId>
+        <artifactId>snowflake-jdbc</artifactId>
+        <version>3.13.4</version>
+      </dependency>
 
       <!-- zkclient & helix-core use netty -->
       <dependency>
