@@ -60,7 +60,9 @@ public class Quickstart extends QuickStartBase {
   }
 
   public Map<String, Object> getConfigOverrides() {
-    return null;
+    Map<String, Object> map = new HashMap<>();
+    map.put("pinot.server.query.executor.timeout", 60000);
+    return map;
   }
 
   public static void printStatus(Color color, String message) {

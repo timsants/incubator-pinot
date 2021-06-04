@@ -33,7 +33,7 @@ public class DataMerger {
   private DataMerger() {
   }
 
-  private enum MergeGranularity {
+  private enum MergeGranularity {X
     MONTH, YEAR
   }
 

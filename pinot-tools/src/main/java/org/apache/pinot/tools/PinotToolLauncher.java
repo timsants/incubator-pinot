@@ -23,6 +23,7 @@ import org.apache.pinot.spi.plugin.PluginManager;
 import org.apache.pinot.tools.filesystem.PinotFSBenchmarkRunner;
 import org.apache.pinot.tools.perf.PerfBenchmarkRunner;
 import org.apache.pinot.tools.perf.QueryRunner;
+import org.apache.pinot.tools.perf.SqlConnector;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
 import org.kohsuke.args4j.CmdLineParser;
@@ -46,7 +47,8 @@ public class PinotToolLauncher {
       @SubCommand(name = "PerfBenchmarkRunner", impl = PerfBenchmarkRunner.class),
       @SubCommand(name = "QueryRunner", impl = QueryRunner.class),
       @SubCommand(name = "PinotFSBenchmarkRunner", impl = PinotFSBenchmarkRunner.class),
-      @SubCommand(name = "SegmentDump", impl = SegmentDumpTool.class)
+      @SubCommand(name = "SegmentDump", impl = SegmentDumpTool.class),
+      @SubCommand(name = "SnowflakeConnector", impl = SqlConnector.class)
   })
   Command _subCommand;
   // @formatter:on
