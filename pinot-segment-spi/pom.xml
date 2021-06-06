@@ -57,6 +57,10 @@
               -->
               <relocations>
                 <relocation>
+                  <pattern>com.google.guava</pattern>
+                  <shadedPattern>shaded.com.google.guava</shadedPattern>
+                </relocation>
+                <relocation>
                   <pattern>com.google.common.base</pattern>
                   <shadedPattern>shaded.com.google.common.base</shadedPattern>
                 </relocation>
