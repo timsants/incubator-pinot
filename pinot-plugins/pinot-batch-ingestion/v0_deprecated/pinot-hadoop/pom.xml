@@ -74,8 +74,8 @@
                       <shadedPattern>shaded.com.fasterxml.jackson</shadedPattern>
                     </relocation>
                     <relocation>
-                      <pattern>org.reflections</pattern>
-                      <shadedPattern>shaded.org.reflections</shadedPattern>
+                      <pattern>org.reflections.util</pattern>
+                      <shadedPattern>shaded.org.reflections.util</shadedPattern>
                     </relocation>
                   </relocations>
                   <transformers>
