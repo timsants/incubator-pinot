@@ -28,17 +28,13 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
-import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
-import java.util.Locale;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-import jdk.vm.ci.meta.Local;
 import org.apache.pinot.controller.helix.ControllerRequestURLBuilder;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
@@ -204,7 +200,7 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   @Override
   public boolean execute() throws Exception {
     // Read data in chunks
-    readDataFromSnowflake();
+    batchReadData();
 
     // Generate segments and upload
     buildAndPushSegments();
@@ -290,7 +286,7 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     }
   }
 
-  private void readDataFromSnowflake() throws Exception {
+  private void batchReadData() throws Exception {
     // Get JDBC connection
     Statement statement = getJDBCConnection();
     // Get count(*) to determine total number of rows in each chunk
@@ -306,26 +302,28 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     LocalDateTime windowStart = LocalDateTime.parse(_startTime, windowFormatter);
     LocalDateTime windowEnd = LocalDateTime.parse(_endTime, windowFormatter);
 
-    LocalDateTime nextBatchEnd = getNextGranularity(windowStart);
+    LocalDateTime batchStart = windowStart;
+    LocalDateTime batchEnd = getNextGranularity(windowStart);
     boolean isLastBatch = false;
     while (!isLastBatch) {
-      if (nextBatchEnd.isAfter(windowEnd)) {
-        nextBatchEnd = windowEnd;
+      if (batchEnd.isAfter(windowEnd)) {
+        batchEnd = windowEnd;
         isLastBatch = true;
       }
 
       //make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
-      _queryTemplate
-      int offset = i * CHUNK_SIZE;
-      int limit = CHUNK_SIZE;
-      if (offset + CHUNK_SIZE > numRows) {
-        limit = numRows - offset;
-      }
+      _queryTemplate.replace("$START", convertDateTimeToDatabaseFormat(batchStart)).replace("$END", convertDateTimeToDatabaseFormat(batchEnd));
+
 
 
       String chunkQuery = _queryTemplate + " LIMIT " + limit + " OFFSET " + offset; //dont do this. need order by.
       LOGGER.info("Chunk query: {}", chunkQuery);
       queryAndSaveChunks(statement, chunkQuery, i);
+
+
+      //
+      batchStart = batchEnd;
+      batchEnd = getNextGranularity(batchEnd);
     }
 
     statement.close();
