@@ -1,0 +1,31 @@
+{
+  "metricFieldSpecs": [
+  ],
+  "dimensionFieldSpecs": [
+    {
+      "name": "O_ORDERKEY",
+      "dataType": "STRING"
+    },
+    {
+      "name": "O_CUSTKEY",
+      "dataType": "STRING"
+    },
+    {
+      "name": "O_ORDERSTATUS",
+      "dataType": "STRING"
+    },
+    {
+      "name": "O_TOTALPRICE",
+      "dataType": "STRING"
+    }
+  ],
+  "dateTimeFieldSpecs": [
+    {
+      "name": "O_ORDERDATE",
+      "dataType": "STRING",
+      "format": "1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM-dd",
+      "granularity": "1:DAYS"
+    }
+  ],
+  "schemaName": "snowflakeTest"
+}

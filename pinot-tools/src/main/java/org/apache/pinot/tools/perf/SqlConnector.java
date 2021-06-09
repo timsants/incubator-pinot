@@ -22,6 +22,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.File;
 import java.io.FileWriter;
+import java.net.URL;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -31,10 +32,13 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
 import java.util.Collections;
 import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import org.apache.commons.io.FileUtils;
 import org.apache.pinot.controller.helix.ControllerRequestURLBuilder;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
@@ -55,6 +59,7 @@ import org.apache.pinot.tools.admin.command.StartBrokerCommand;
 import org.apache.pinot.tools.admin.command.StartControllerCommand;
 import org.apache.pinot.tools.admin.command.StartServerCommand;
 import org.apache.pinot.tools.admin.command.StartZookeeperCommand;
+import org.apache.pinot.tools.admin.command.StopProcessCommand;
 import org.kohsuke.args4j.Option;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -94,9 +99,10 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   private long _dataPullAmount; //? do we need this
   private String _dataPullGranularity; //how big each chunk should be SECONDS, MINUTES, HOURS, DAYS
 
-  private String _windowDateTimeFormat; //optional; Format of startTime and endTime
+  private String _windowDateTimeFormat = "yyyy-MM-dd"; //optional; Format of startTime and endTime
   private String _startTime; //string ISO format or could add format...
   private String _endTime;
+  private File _tempDir;
 
 
 
@@ -123,9 +129,18 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   }
 
   public static void main(String args[]) throws Exception {
+    SqlConnector connector = new SqlConnector();
+    connector.validate();
+    connector.initTestEnv();
+    connector.execute();
+    connector.stop();
+  }
 
-
-    new SqlConnector().initTestEnv().execute();
+  private void stop() throws Exception {
+    StopProcessCommand stopper = new StopProcessCommand(false);
+    stopper.stopController().stopBroker().stopServer().stopZookeeper();
+    stopper.execute();
+    FileUtils.cleanDirectory(_tempDir);
   }
 
   //TODO make into framework. snowflake impl.
@@ -140,17 +155,38 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     _database = "SNOWFLAKE_SAMPLE_DATA";
     _schema = "TPCH_SF1";
 
-    _queryTemplate = "SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERDATE FROM ORDERS WHERE O_ORDERDATE > '1995-01-01' ORDER BY O_ORDERKEY";
+    _queryTemplate = "SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERDATE FROM ORDERS WHERE O_ORDERDATE > $START AND O_ORDERDATE < $END";
+
+    _startTime = "1995-01-01";
+    _endTime = "1995-01-20";
+
+    _dataPullGranularity = "DAYS"; //what if data pull amount is finer granularity than time format
+    _dataPullAmount = 12;
+
+    _timeColumnFormat = "yyyy-MM-dd";
+    _timeColumnName = "O_ORDERDATE";
 
     _pinotTable = "snowflakeTest";
+
 
     startCluster("mycluster");
 
     return this;
   }
 
+  /**
+   * Validate provided paramters.
+   */
+  private void validate() {
+    // make sure _dataPullGranularity is not smaller than timeColumnFormatGranularity
+  }
+
   private void startCluster(String clusterName) throws Exception {
+    _tempDir = new File(FileUtils.getTempDirectory(), String.valueOf(System.currentTimeMillis()));
+
     StartZookeeperCommand zkStarter = new StartZookeeperCommand();
+    zkStarter.setPort(2181);
+    zkStarter.setDataDir(new File(_tempDir, "PinotZkDir").getAbsolutePath());
     zkStarter.execute();
 
     DeleteClusterCommand deleteClusterCommand = new DeleteClusterCommand().setClusterName(clusterName);
@@ -176,25 +212,23 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
 
   private void addTable()
       throws Exception {
-    if (_tableConfigFile != null) {
-      AddTableCommand addTableCommand =
-          new AddTableCommand().setControllerPort(_controllerPort).setSchemaFile(_schemaFileName)
-              .setTableConfigFile(_tableConfigFile).setExecute(true);
-      addTableCommand.execute();
-      return;
-    }
+    String tableConfigFile = getClass().getClassLoader().getResource("snowflake/snowflakeTestConfig.json").getFile();
 
-    if (_tableName == null) {
-      LOGGER.error("Table info not specified in configuration, please specify either config file or table name");
-      return;
-    }
+    String schemaFile = getClass().getClassLoader().getResource("snowflake/snowflakeTestSchema.json").getFile();
 
-    String controllerAddress = "http://" + _localhost + ":" + _controllerPort;
+    AddTableCommand addTableCommand =
+          new AddTableCommand().setControllerPort("9000").setSchemaFile(schemaFile)
+              .setTableConfigFile(tableConfigFile).setExecute(true);
+
+    addTableCommand.execute();
+
+    String controllerAddress = "http://localhost:9000";
     TableConfig tableConfig =
-        new TableConfigBuilder(TableType.OFFLINE).setTableName(_tableName).setTimeColumnName(_timeColumnName)
-            .setTimeType(_timeUnit).setNumReplicas(3).setBrokerTenant("broker").setServerTenant("server").build();
+        new TableConfigBuilder(TableType.OFFLINE).setTableName("snowflakeTest").setTimeColumnName(_timeColumnName)
+            .setTimeType("days").setNumReplicas(3).setBrokerTenant("broker").setServerTenant("server").build();
     sendPostRequest(ControllerRequestURLBuilder.baseUrl(controllerAddress).forTableCreate(),
         tableConfig.toJsonString());
+
   }
 
   @Override
@@ -229,8 +263,11 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     spec.setPinotFSSpecs(Collections.singletonList(pinotFSSpec));
 
     RecordReaderSpec recordReaderSpec = new RecordReaderSpec();
+    /*
     recordReaderSpec.setDataFormat("parquet");
     recordReaderSpec.setClassName("org.apache.pinot.plugin.inputformat.parquet.ParquetRecordReader");
+     */
+    recordReaderSpec.setClassName("org.apache.pinot.plugin.inputformat.json.JSONRecordReader");
     spec.setRecordReaderSpec(recordReaderSpec);
 
     TableSpec tableSpec = new TableSpec();
@@ -286,44 +323,48 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     }
   }
 
+
   private void batchReadData() throws Exception {
     // Get JDBC connection
     Statement statement = getJDBCConnection();
     // Get count(*) to determine total number of rows in each chunk
-    int numRows = getNumberOfRows(statement);
-    int numChunks = numRows / CHUNK_SIZE + 1; // Add 1 since division rounds down
+    //int numRows = getNumberOfRows(statement);
+    //int numChunks = numRows / CHUNK_SIZE + 1; // Add 1 since division rounds down
 
-    LOGGER.info("Will be fetching {} number of rows and {} chunks", numRows, numChunks);
+    //LOGGER.info("Will be fetching {} number of rows and {} chunks", numRows, numChunks);
 
-    if (_windowDateTimeFormat == null) {
-      _windowDateTimeFormat = "yyyy-MM-dd"; //use ISO format
-    }
-    DateTimeFormatter windowFormatter = DateTimeFormatter.ofPattern(_windowDateTimeFormat);
+    // TODO initialize this at top
+    DateTimeFormatter windowFormatter = new DateTimeFormatterBuilder().appendPattern(_windowDateTimeFormat)
+        .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
+        .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
+        .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
+        .toFormatter();
+
     LocalDateTime windowStart = LocalDateTime.parse(_startTime, windowFormatter);
     LocalDateTime windowEnd = LocalDateTime.parse(_endTime, windowFormatter);
 
     LocalDateTime batchStart = windowStart;
     LocalDateTime batchEnd = getNextGranularity(windowStart);
     boolean isLastBatch = false;
+    int chunkNum = 1;
     while (!isLastBatch) {
+      //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
+
       if (batchEnd.isAfter(windowEnd)) {
         batchEnd = windowEnd;
         isLastBatch = true;
       }
 
-      //make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
-      _queryTemplate.replace("$START", convertDateTimeToDatabaseFormat(batchStart)).replace("$END", convertDateTimeToDatabaseFormat(batchEnd));
+      String chunkQuery = _queryTemplate
+          .replace("> $START", "> '" + convertDateTimeToDatabaseFormat(batchStart) + "'")
+          .replace("< $END", "<= '" + convertDateTimeToDatabaseFormat(batchEnd) + "'");
 
-
-
-      String chunkQuery = _queryTemplate + " LIMIT " + limit + " OFFSET " + offset; //dont do this. need order by.
       LOGGER.info("Chunk query: {}", chunkQuery);
-      queryAndSaveChunks(statement, chunkQuery, i);
+      queryAndSaveChunks(statement, chunkQuery, chunkNum);
 
-
-      //
-      batchStart = batchEnd;
+      batchStart = batchEnd; //TODO needs to be incremented since between is inclusive
       batchEnd = getNextGranularity(batchEnd);
+      chunkNum++;
     }
 
     statement.close();
