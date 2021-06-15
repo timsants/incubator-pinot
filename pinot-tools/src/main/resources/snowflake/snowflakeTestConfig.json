@@ -2,7 +2,7 @@
   "tableName": "snowflakeTest",
   "tableType": "OFFLINE",
   "segmentsConfig": {
-    "timeColumnName": "DaysSinceEpoch",
+    "timeColumnName": "O_ORDERDATE",
     "timeType": "DAYS",
     "segmentPushType": "APPEND",
     "segmentAssignmentStrategy": "BalanceNumSegmentAssignmentStrategy",

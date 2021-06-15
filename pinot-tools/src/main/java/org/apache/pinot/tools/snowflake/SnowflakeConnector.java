@@ -16,13 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pinot.tools.perf;
+package org.apache.pinot.tools.snowflake;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.File;
 import java.io.FileWriter;
-import java.net.URL;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -51,8 +50,6 @@ import org.apache.pinot.spi.ingestion.batch.spec.RecordReaderSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.SegmentGenerationJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.TableSpec;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
-import org.apache.pinot.tools.AbstractBaseCommand;
-import org.apache.pinot.tools.Command;
 import org.apache.pinot.tools.admin.command.AddTableCommand;
 import org.apache.pinot.tools.admin.command.DeleteClusterCommand;
 import org.apache.pinot.tools.admin.command.StartBrokerCommand;
@@ -67,15 +64,15 @@ import org.slf4j.LoggerFactory;
 import static org.apache.pinot.tools.admin.command.AbstractBaseAdminCommand.sendPostRequest;
 
 
-public class SqlConnector extends AbstractBaseCommand implements Command {
-  private static final Logger LOGGER = LoggerFactory.getLogger(SqlConnector.class);
+public class SnowflakeConnector implements SqlConnector {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SnowflakeConnector.class);
 
-  private static final int CHUNK_SIZE = 100000;
   private static final String TEMP_OUTPUT_DIR = "/tmp/snowflake";
   private static final Pattern COUNT_STAR_REGEX = Pattern.compile("(?i)(select)(.*)(from.*)");
 
   //make all of these database props - multivalue
-  @Option(name = "-username", required = true, metaVar = "<int>", usage = "Snowflake user name")
+
+  //Snowflake user name
   private String _username;
   @Option(name = "-password", required = true, metaVar = "<int>", usage = "Snowflake password")
   private String _password;
@@ -93,6 +90,9 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   @Option(name = "-queryTemplate", required = true, metaVar = "<int>", usage = "Templatized SQL query for pulling from Snowflake table")
   private String _queryTemplate;
 
+  private File _tempDir;
+
+
   private String _timeColumnFormat; //format of time column expressed as date format. other accepted values are millisecondsSinceEpoch and secondsSinceEpoch.
   private String _timeColumnName; //name of column
 
@@ -102,52 +102,42 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   private String _windowDateTimeFormat = "yyyy-MM-dd"; //optional; Format of startTime and endTime
   private String _startTime; //string ISO format or could add format...
   private String _endTime;
-  private File _tempDir;
-
-
-
-
   @Option(name = "-pinotTable", required = true, metaVar = "<int>", usage = "Pinot table to import data into")
   private String _pinotTable;
   @Option(name = "-help", required = false, help = true, aliases = {"-h", "--h", "--help"}, usage = "Print this message.")
   private boolean _help;
 
+  private boolean _isStopped;
 
-  @Override
-  public boolean getHelp() {
-    return _help;
-  }
+  private DateTimeFormatter _windowFormatter;
 
-  @Override
-  public String getName() {
-    return getClass().getSimpleName();
-  }
-
-  @Override
-  public String description() {
-    return "Pinot tool snowflake connector\n";
-  }
 
   public static void main(String args[]) throws Exception {
-    SqlConnector connector = new SqlConnector();
-    connector.validate();
+    SnowflakeConnector connector = new SnowflakeConnector();
+    connector.init();
     connector.initTestEnv();
     connector.execute();
     connector.stop();
   }
 
   private void stop() throws Exception {
+    if (_isStopped) {
+      return;
+    }
+
     StopProcessCommand stopper = new StopProcessCommand(false);
     stopper.stopController().stopBroker().stopServer().stopZookeeper();
     stopper.execute();
     FileUtils.cleanDirectory(_tempDir);
+
+    _isStopped = true;
   }
 
   //TODO make into framework. snowflake impl.
   //parameters
   //sql format dialect
 
-  private SqlConnector initTestEnv() throws Exception {
+  private SnowflakeConnector initTestEnv() throws Exception {
     _username = "timsants";
     _password = "egh9SMUD!thuc*toom";
     _account = "xg65443.west-us-2.azure";
@@ -177,8 +167,15 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   /**
    * Validate provided paramters.
    */
-  private void validate() {
+  private void init() {
     // make sure _dataPullGranularity is not smaller than timeColumnFormatGranularity
+
+
+    _windowFormatter = new DateTimeFormatterBuilder().appendPattern(_windowDateTimeFormat)
+        .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
+        .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
+        .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
+        .toFormatter();
   }
 
   private void startCluster(String clusterName) throws Exception {
@@ -206,7 +203,6 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
         new StartServerCommand().setPort(Integer.valueOf("7000")).setClusterName(clusterName);
     serverStarter.execute();
 
-
     addTable();
   }
 
@@ -228,10 +224,9 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
             .setTimeType("days").setNumReplicas(3).setBrokerTenant("broker").setServerTenant("server").build();
     sendPostRequest(ControllerRequestURLBuilder.baseUrl(controllerAddress).forTableCreate(),
         tableConfig.toJsonString());
-
   }
 
-  @Override
+  //@Override
   public boolean execute() throws Exception {
     // Read data in chunks
     batchReadData();
@@ -253,7 +248,9 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     spec.setExecutionFrameworkSpec(frameworkSpec);
     spec.setJobType("SegmentCreationAndTarPush");
     spec.setInputDirURI(TEMP_OUTPUT_DIR);
-    spec.setIncludeFileNamePattern("glob:*.parquet");
+    //spec.setIncludeFileNamePattern("glob:*.parquet");
+    spec.setIncludeFileNamePattern("glob:" + TEMP_OUTPUT_DIR + "/*.json");
+
     spec.setOutputDirURI(TEMP_OUTPUT_DIR + "/segments");
     spec.setOverwriteOutput(true);
 
@@ -327,21 +324,13 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
   private void batchReadData() throws Exception {
     // Get JDBC connection
     Statement statement = getJDBCConnection();
+
+    LocalDateTime windowStart = LocalDateTime.parse(_startTime, _windowFormatter);
+    LocalDateTime windowEnd = LocalDateTime.parse(_endTime, _windowFormatter);
+
     // Get count(*) to determine total number of rows in each chunk
-    //int numRows = getNumberOfRows(statement);
-    //int numChunks = numRows / CHUNK_SIZE + 1; // Add 1 since division rounds down
+    int numRows = getNumberOfRows(statement, windowStart, windowEnd);
 
-    //LOGGER.info("Will be fetching {} number of rows and {} chunks", numRows, numChunks);
-
-    // TODO initialize this at top
-    DateTimeFormatter windowFormatter = new DateTimeFormatterBuilder().appendPattern(_windowDateTimeFormat)
-        .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
-        .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
-        .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
-        .toFormatter();
-
-    LocalDateTime windowStart = LocalDateTime.parse(_startTime, windowFormatter);
-    LocalDateTime windowEnd = LocalDateTime.parse(_endTime, windowFormatter);
 
     LocalDateTime batchStart = windowStart;
     LocalDateTime batchEnd = getNextGranularity(windowStart);
@@ -370,13 +359,16 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     statement.close();
   }
 
-  private int getNumberOfRows(Statement statement) throws SQLException {
+  private int getNumberOfRows(Statement statement, LocalDateTime dateTimeStart, LocalDateTime dateTimeEnd) throws SQLException {
     // Generate count(*) query to get number of rows
     Matcher matcher = COUNT_STAR_REGEX.matcher(_queryTemplate);
     matcher.find();
     String countQuery = matcher.group(1) + " COUNT(*) " + matcher.group(3);
+    String countQueryWithTimeRange = countQuery.replace("$START", "'" + convertDateTimeToDatabaseFormat(dateTimeStart) + "'")
+        .replace("< $END", "<= '" + convertDateTimeToDatabaseFormat(dateTimeEnd) + "'");
 
-    ResultSet resultSet = statement.executeQuery(countQuery);
+    LOGGER.info("Making query {}", countQueryWithTimeRange);
+    ResultSet resultSet = statement.executeQuery(countQueryWithTimeRange);
 
     // fetch metadata
     ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
@@ -389,11 +381,13 @@ public class SqlConnector extends AbstractBaseCommand implements Command {
     resultSet.next();
     int rowCount = resultSet.getInt( 1);
 
+    LOGGER.info("There are {} number of rows in the time range {} to {}", rowCount, dateTimeStart.toString(), dateTimeEnd.toString());
+
     return rowCount;
   }
 
   private void queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
-    // make query
+    LOGGER.info("Executing query: {}", query);
     ResultSet resultSet = statement.executeQuery(query);
 
     ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
