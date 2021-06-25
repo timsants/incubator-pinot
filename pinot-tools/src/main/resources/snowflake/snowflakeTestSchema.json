@@ -3,25 +3,25 @@
   ],
   "dimensionFieldSpecs": [
     {
-      "name": "O_ORDERKEY",
+      "name": "o_orderkey",
       "dataType": "STRING"
     },
     {
-      "name": "O_CUSTKEY",
+      "name": "o_custkey",
       "dataType": "STRING"
     },
     {
-      "name": "O_ORDERSTATUS",
+      "name": "o_orderstatus",
       "dataType": "STRING"
     },
     {
-      "name": "O_TOTALPRICE",
+      "name": "o_totalprice",
       "dataType": "STRING"
     }
   ],
   "dateTimeFieldSpecs": [
     {
-      "name": "O_ORDERDATE",
+      "name": "o_orderdate",
       "dataType": "STRING",
       "format": "1:DAYS:SIMPLE_DATE_FORMAT:yyyy-MM-dd",
       "granularity": "1:DAYS"

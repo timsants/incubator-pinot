@@ -18,12 +18,11 @@
  */
 package org.apache.pinot.tools.snowflake;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ObjectNode;
 import java.io.File;
-import java.io.FileWriter;
-import java.sql.Connection;
-import java.sql.DriverManager;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
@@ -34,11 +33,11 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
 import java.util.Collections;
-import java.util.Properties;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import org.apache.commons.io.FileUtils;
 import org.apache.pinot.controller.helix.ControllerRequestURLBuilder;
+import org.apache.pinot.plugin.inputformat.parquet.ResultSetParquetTransformer;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.ingestion.batch.IngestionJobLauncher;
@@ -57,42 +56,38 @@ import org.apache.pinot.tools.admin.command.StartControllerCommand;
 import org.apache.pinot.tools.admin.command.StartServerCommand;
 import org.apache.pinot.tools.admin.command.StartZookeeperCommand;
 import org.apache.pinot.tools.admin.command.StopProcessCommand;
-import org.kohsuke.args4j.Option;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static org.apache.pinot.tools.admin.command.AbstractBaseAdminCommand.sendPostRequest;
 
 
-public class SnowflakeConnector implements SqlConnector {
+public class SnowflakeConnector extends SqlConnector {
   private static final Logger LOGGER = LoggerFactory.getLogger(SnowflakeConnector.class);
 
-  private static final String TEMP_OUTPUT_DIR = "/tmp/snowflake";
   private static final Pattern COUNT_STAR_REGEX = Pattern.compile("(?i)(select)(.*)(from.*)");
-
-  //make all of these database props - multivalue
+  private static final String TEMP_DIR_PREFIX = "sql_connector_data_";
 
   //Snowflake user name
   private String _username;
-  @Option(name = "-password", required = true, metaVar = "<int>", usage = "Snowflake password")
+  //Snowflake password
   private String _password;
-  @Option(name = "-account", required = true, metaVar = "<int>", usage = "Snowflake account name")
+  //Snowflake account name
   private String _account;
-  @Option(name = "-database", required = true, metaVar = "<int>", usage = "Snowflake database")
+  //Snowflake database
   private String _database;
-  @Option(name = "-schema", required = true, metaVar = "<int>", usage = "Snowflake schema")
+  //Snowflake schema
   private String _schema;
-  @Option(name = "-table", required = true, metaVar = "<int>", usage = "Snowflake table")
+  //Snowflake table
   private String _table;
-  @Option(name = "-controllerUrl", required = true, metaVar = "<int>", usage = "Pinot controller URL")
+  //Pinot controller URL
   private String _controllerUrl;
-
-  @Option(name = "-queryTemplate", required = true, metaVar = "<int>", usage = "Templatized SQL query for pulling from Snowflake table")
+  //Templatized SQL query for pulling from Snowflake table
   private String _queryTemplate;
+  //Pinot table to import data into
+  private String _pinotTable;
 
   private File _tempDir;
-
-
   private String _timeColumnFormat; //format of time column expressed as date format. other accepted values are millisecondsSinceEpoch and secondsSinceEpoch.
   private String _timeColumnName; //name of column
 
@@ -102,14 +97,12 @@ public class SnowflakeConnector implements SqlConnector {
   private String _windowDateTimeFormat = "yyyy-MM-dd"; //optional; Format of startTime and endTime
   private String _startTime; //string ISO format or could add format...
   private String _endTime;
-  @Option(name = "-pinotTable", required = true, metaVar = "<int>", usage = "Pinot table to import data into")
-  private String _pinotTable;
-  @Option(name = "-help", required = false, help = true, aliases = {"-h", "--h", "--help"}, usage = "Print this message.")
-  private boolean _help;
 
   private boolean _isStopped;
 
   private DateTimeFormatter _windowFormatter;
+  private ResultSetParquetTransformer _resultSetParquetTransformer;
+  private Path _tmpDataDir;
 
 
   public static void main(String args[]) throws Exception {
@@ -117,7 +110,7 @@ public class SnowflakeConnector implements SqlConnector {
     connector.init();
     connector.initTestEnv();
     connector.execute();
-    connector.stop();
+    //connector.stop();
   }
 
   private void stop() throws Exception {
@@ -138,10 +131,23 @@ public class SnowflakeConnector implements SqlConnector {
   //sql format dialect
 
   private SnowflakeConnector initTestEnv() throws Exception {
+    SqlConnectorConfig sqlConnectorConfig = new SnowflakeConfig(
+        "timsants",
+        "egh9SMUD!thuc*toom",
+        "xg65443.west-us-2.azure",
+        "SNOWFLAKE_SAMPLE_DATA",
+        "TPCH_SF1",
+        "ORDERS"
+    );
+
+    _pinotTable = "snowflakeTest";
+
+    setSqlConnectorConfig(sqlConnectorConfig);
+    setPinotTable(_pinotTable);
+
     _username = "timsants";
     _password = "egh9SMUD!thuc*toom";
     _account = "xg65443.west-us-2.azure";
-
     _database = "SNOWFLAKE_SAMPLE_DATA";
     _schema = "TPCH_SF1";
 
@@ -156,7 +162,6 @@ public class SnowflakeConnector implements SqlConnector {
     _timeColumnFormat = "yyyy-MM-dd";
     _timeColumnName = "O_ORDERDATE";
 
-    _pinotTable = "snowflakeTest";
 
 
     startCluster("mycluster");
@@ -167,15 +172,18 @@ public class SnowflakeConnector implements SqlConnector {
   /**
    * Validate provided paramters.
    */
-  private void init() {
+  private void init() throws IOException {
     // make sure _dataPullGranularity is not smaller than timeColumnFormatGranularity
-
+    // make sure all template values are present
 
     _windowFormatter = new DateTimeFormatterBuilder().appendPattern(_windowDateTimeFormat)
         .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
         .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
         .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
         .toFormatter();
+
+    _resultSetParquetTransformer = new ResultSetParquetTransformer();
+    _tmpDataDir = Files.createTempDirectory(TEMP_DIR_PREFIX);
   }
 
   private void startCluster(String clusterName) throws Exception {
@@ -226,18 +234,8 @@ public class SnowflakeConnector implements SqlConnector {
         tableConfig.toJsonString());
   }
 
-  //@Override
-  public boolean execute() throws Exception {
-    // Read data in chunks
-    batchReadData();
-
-    // Generate segments and upload
-    buildAndPushSegments();
-
-    return true;
-  }
-
-  private void buildAndPushSegments() {
+  @Override
+  void buildAndPushSegments() {
     ExecutionFrameworkSpec frameworkSpec = new ExecutionFrameworkSpec();
     frameworkSpec.setName("standalone");
     frameworkSpec.setSegmentGenerationJobRunnerClassName("org.apache.pinot.plugin.ingestion.batch.standalone.SegmentGenerationJobRunner");
@@ -247,11 +245,10 @@ public class SnowflakeConnector implements SqlConnector {
     SegmentGenerationJobSpec spec = new SegmentGenerationJobSpec();
     spec.setExecutionFrameworkSpec(frameworkSpec);
     spec.setJobType("SegmentCreationAndTarPush");
-    spec.setInputDirURI(TEMP_OUTPUT_DIR);
-    //spec.setIncludeFileNamePattern("glob:*.parquet");
-    spec.setIncludeFileNamePattern("glob:" + TEMP_OUTPUT_DIR + "/*.json");
+    spec.setInputDirURI(_tmpDataDir.toString());
+    spec.setIncludeFileNamePattern("glob:" + _tmpDataDir.toString() + "/*.parquet");
 
-    spec.setOutputDirURI(TEMP_OUTPUT_DIR + "/segments");
+    spec.setOutputDirURI(_tmpDataDir.toString() + "/segments");
     spec.setOverwriteOutput(true);
 
     PinotFSSpec pinotFSSpec = new PinotFSSpec();
@@ -260,11 +257,9 @@ public class SnowflakeConnector implements SqlConnector {
     spec.setPinotFSSpecs(Collections.singletonList(pinotFSSpec));
 
     RecordReaderSpec recordReaderSpec = new RecordReaderSpec();
-    /*
+
     recordReaderSpec.setDataFormat("parquet");
     recordReaderSpec.setClassName("org.apache.pinot.plugin.inputformat.parquet.ParquetRecordReader");
-     */
-    recordReaderSpec.setClassName("org.apache.pinot.plugin.inputformat.json.JSONRecordReader");
     spec.setRecordReaderSpec(recordReaderSpec);
 
     TableSpec tableSpec = new TableSpec();
@@ -321,10 +316,8 @@ public class SnowflakeConnector implements SqlConnector {
   }
 
 
-  private void batchReadData() throws Exception {
-    // Get JDBC connection
-    Statement statement = getJDBCConnection();
-
+  @Override
+  void batchReadData(Statement statement) throws Exception {
     LocalDateTime windowStart = LocalDateTime.parse(_startTime, _windowFormatter);
     LocalDateTime windowEnd = LocalDateTime.parse(_endTime, _windowFormatter);
 
@@ -355,8 +348,6 @@ public class SnowflakeConnector implements SqlConnector {
       batchEnd = getNextGranularity(batchEnd);
       chunkNum++;
     }
-
-    statement.close();
   }
 
   private int getNumberOfRows(Statement statement, LocalDateTime dateTimeStart, LocalDateTime dateTimeEnd) throws SQLException {
@@ -386,7 +377,7 @@ public class SnowflakeConnector implements SqlConnector {
     return rowCount;
   }
 
-  private void queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
+  private InputStream queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
     LOGGER.info("Executing query: {}", query);
     ResultSet resultSet = statement.executeQuery(query);
 
@@ -397,8 +388,12 @@ public class SnowflakeConnector implements SqlConnector {
       LOGGER.info("Column {} : type={}", colIdx, resultSetMetaData.getColumnTypeName(colIdx + 1));
     }
 
-    File file = new File(TEMP_OUTPUT_DIR + "/chunk_"+ chunkNum + ".json");
-    FileWriter fileWriter = new FileWriter(file);
+    InputStream inputStream = _resultSetParquetTransformer
+        .transform(resultSet, "test" , "username" + "." + "database", _tmpDataDir, Integer.toString(chunkNum));
+
+    return inputStream;
+
+/*
     while (resultSet.next()) {
 
       // convert to parquet here and write to file
@@ -412,44 +407,16 @@ public class SnowflakeConnector implements SqlConnector {
       LOGGER.info("Results: {}", objectNode.toString());
     }
     fileWriter.close();
+
+ */
   }
 
-  private Statement getJDBCConnection() throws SQLException {
-    LOGGER.debug("Creating JDBC connection...");
-    Connection connection = getConnection();
-    LOGGER.info("Done creating JDBC connection");
-    // create statement
-    LOGGER.info("Create JDBC statement");
-    return connection.createStatement();
-  }
-
-  private Connection getConnection()
-      throws SQLException
-  {
-    try
-    {
+  @Override
+  void verifyDriverPresent() throws IllegalStateException {
+    try {
       Class.forName("com.snowflake.client.jdbc.SnowflakeDriver");
+    } catch (ClassNotFoundException e) {
+      throw new IllegalStateException("Snowflake driver not found", e);
     }
-    catch (ClassNotFoundException ex)
-    {
-      LOGGER.error("Driver not found");
-    }
-    // build connection properties
-    Properties properties = new Properties();
-    properties.put("user", _username);     // TIMSANTS
-    properties.put("password", _password); // "egh9SMUD!thuc*toom"
-    properties.put("account", _account);  // "xg65443"
-    properties.put("db", _database);       // "SNOWFLAKE_SAMPLE_DATA"
-    properties.put("schema", _schema);   // "TPCH_SF001"
-    //properties.put("tracing", "on");
-
-    // create a new connection
-    String connectStr = System.getenv("SF_JDBC_CONNECT_STRING");
-    // use the default connection string if it is not set in environment
-    if(connectStr == null)
-    {
-      connectStr = "jdbc:snowflake://" + _account + ".snowflakecomputing.com"; // replace accountName with your account name
-    }
-    return DriverManager.getConnection(connectStr, properties);
   }
 }

@@ -124,8 +124,9 @@ public class SegmentIndexCreationDriverImpl implements SegmentIndexCreationDrive
         LOGGER.warn("Using class: {} to read segment, ignoring configured file format: {}", recordReaderClassName,
             fileFormat);
       }
-      return RecordReaderFactory.getRecordReaderByClass(recordReaderClassName, dataFile, sourceFields,
+      RecordReader recordReader = RecordReaderFactory.getRecordReaderByClass(recordReaderClassName, dataFile, sourceFields,
           segmentGeneratorConfig.getReaderConfig());
+      return recordReader;
     }
 
     // NOTE: PinotSegmentRecordReader does not support time conversion (field spec must match)
