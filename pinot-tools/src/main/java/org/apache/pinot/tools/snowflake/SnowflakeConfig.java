@@ -8,25 +8,26 @@ import java.util.Properties;
  */
 public class SnowflakeConfig implements SqlConnectorConfig {
 
-  //Snowflake user name
+  // Snowflake user name
   public String _username;
 
-  //Snowflake password
+  // Snowflake password
   public String _password;
 
-  //Snowflake account name
+  // Snowflake account name
   public String _account;
 
-  //Snowflake database
+  // Snowflake database
   public String _database;
 
-  //Snowflake schema
+  // Snowflake schema
   public String _schema;
 
-  //Snowflake table
+  // Snowflake table
   public String _table;
 
-  public SnowflakeConfig(String username, String password, String account, String database, String schema, String table) {
+  public SnowflakeConfig(String username, String password, String account, String database, String schema,
+      String table) {
     _username = username;
     _password = password;
     _account = account;
