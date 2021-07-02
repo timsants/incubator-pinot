@@ -94,7 +94,7 @@ public class SnowflakeConnectorTest {
     assertEquals(pinotColumns,
         Sets.newSet("o_custkey","o_orderdate","o_orderkey","o_orderstatus","o_totalprice"));
 
-    Thread.sleep(600000);
+    //Thread.sleep(600000);
   }
 
   public JsonNode runPinotQuery(String query) throws Exception {

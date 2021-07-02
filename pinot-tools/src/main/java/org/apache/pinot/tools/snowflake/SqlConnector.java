@@ -20,9 +20,11 @@ package org.apache.pinot.tools.snowflake;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import groovy.sql.Sql;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Array;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
@@ -44,13 +46,17 @@ import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlOperator;
 import org.apache.calcite.sql.SqlSelect;
 import org.apache.calcite.sql.dialect.SnowflakeSqlDialect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.sql.type.SqlTypeName;
+import org.apache.calcite.util.DateString;
 import org.apache.pinot.plugin.inputformat.parquet.ResultSetParquetTransformer;
 import org.apache.pinot.spi.ingestion.batch.IngestionJobLauncher;
 import org.apache.pinot.spi.ingestion.batch.spec.ExecutionFrameworkSpec;
@@ -144,30 +150,43 @@ public abstract class SqlConnector {
     SqlSelect sqlSelect = (SqlSelect) sqlNode;
     SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere());
 
+    SqlIdentifier timeColumn = (SqlIdentifier) dateRangeNode.getOperands()[0];
+
+
 
     LocalDateTime batchStart = windowStart;
     LocalDateTime batchEnd = getNextBatchEnd(windowStart);
     int chunkNum = 1;
+    boolean isLastChunk = false;
     while (true) {
       //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
       /*
 
       String chunkQuery = _sqlQueryConfig.getQueryTemplate()
-          .replace("> $START", "> '" + _dateTimeToDBFormatConverter.apply(batchStart) + "'")
+          .replace(">= $START", "> '" + _dateTimeToDBFormatConverter.apply(batchStart) + "'")
           .replace("< $END", "<= '" + _dateTimeToDBFormatConverter.apply(batchEnd) + "'");
 */
-      String chunkQuery = replaceQueryStartAndEnd(sqlSelect, dateRangeNode,
+      String chunkQuery = replaceQueryStartAndEndBatch(
+          sqlSelect,
+          dateRangeNode,
+          timeColumn,
           _dateTimeToDBFormatConverter.apply(batchStart),
-          _dateTimeToDBFormatConverter.apply(batchEnd));
+          _dateTimeToDBFormatConverter.apply(batchEnd),
+          isLastChunk);
       queryAndSaveChunks(statement, chunkQuery, chunkNum);
 
-      if (batchEnd == _sqlQueryConfig.getWindowEndTime()) {
+      if (isLastChunk) {
         break;
       }
 
       batchStart = batchEnd; //TODO needs to be incremented since between is inclusive
       batchEnd = getNextBatchEnd(batchEnd);
       chunkNum++;
+
+      if (batchEnd == _sqlQueryConfig.getWindowEndTime()) {
+        isLastChunk = true;
+        //handle truncating here instead of getNextBatch
+      }
     }
   }
 
@@ -183,6 +202,37 @@ public abstract class SqlConnector {
     LOGGER.info("New query with replaced dates is {}", chunkQuery);
     return chunkQuery;
   }
+
+
+  private String replaceQueryStartAndEndBatch(SqlSelect sqlSelect, SqlBasicCall dateRangeNode, SqlIdentifier timeColumn, String startReplace,
+      String endReplace, boolean isLastChunk) {
+
+    SqlNode[] startCalls = new SqlNode[2];
+    SqlLiteral startTime = SqlLiteral.createDate(new DateString(startReplace), SqlParserPos.ZERO);
+    startCalls[0] = timeColumn;
+    startCalls[1] = startTime;
+    SqlBasicCall gtStart = new SqlBasicCall(SqlStdOperatorTable.GREATER_THAN_OR_EQUAL, startCalls, SqlParserPos.ZERO);
+
+    SqlNode[] endCalls = new SqlNode[2];
+    SqlLiteral endTime = SqlLiteral.createDate(new DateString(endReplace), SqlParserPos.ZERO);
+    endCalls[0] = timeColumn;
+    endCalls[1] = endTime;
+
+    SqlOperator ltOperator = isLastChunk ? SqlStdOperatorTable.LESS_THAN_OR_EQUAL : SqlStdOperatorTable.LESS_THAN;
+
+    SqlBasicCall ltEnd = new SqlBasicCall(ltOperator, endCalls, SqlParserPos.ZERO);
+
+
+    dateRangeNode.setOperator(SqlStdOperatorTable.AND);
+    dateRangeNode.setOperand(0, gtStart); //set start
+    dateRangeNode.setOperand(1, ltEnd); //set end
+
+    String chunkQuery = sqlSelect.toSqlString(new SnowflakeSqlDialect(SnowflakeSqlDialect.EMPTY_CONTEXT)).getSql();
+    LOGGER.info("New query with replaced dates is {}", chunkQuery);
+    return chunkQuery;
+  }
+
+
 
   private void queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
     LOGGER.info("Executing query: {}", query);
@@ -289,7 +339,7 @@ public abstract class SqlConnector {
       }
     }
 
-    if (sqlNode instanceof SqlCall) {
+    if (sqlNode instanceof SqlBasicCall) {
       for (SqlNode node : ((SqlBasicCall) sqlNode).getOperandList()) {
         return findBetweenOperator(node);
       }
