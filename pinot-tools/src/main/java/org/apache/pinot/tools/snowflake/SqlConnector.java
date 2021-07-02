@@ -18,8 +18,9 @@
  */
 package org.apache.pinot.tools.snowflake;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import java.io.InputStream;
+import groovy.sql.Sql;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -31,11 +32,25 @@ import java.sql.Statement;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeFormatterBuilder;
-import java.time.temporal.ChronoField;
 import java.util.Collections;
+import java.util.List;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import org.apache.calcite.sql.SqlBasicCall;
+import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.dialect.SnowflakeSqlDialect;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.parser.SqlParserPos;
 import org.apache.pinot.plugin.inputformat.parquet.ResultSetParquetTransformer;
 import org.apache.pinot.spi.ingestion.batch.IngestionJobLauncher;
 import org.apache.pinot.spi.ingestion.batch.spec.ExecutionFrameworkSpec;
@@ -45,6 +60,8 @@ import org.apache.pinot.spi.ingestion.batch.spec.PushJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.RecordReaderSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.SegmentGenerationJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.TableSpec;
+import org.apache.pinot.sql.parsers.CalciteSqlParser;
+import org.mortbay.util.SingletonList;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,7 +69,6 @@ public abstract class SqlConnector {
 
   private static final Logger LOGGER = LoggerFactory.getLogger(SqlConnector.class);
 
-  private static final Pattern COUNT_STAR_REGEX = Pattern.compile("(?i)(select)(.*)(from.*)");
   private static final String TMP_DIR_PREFIX = "sql_connector_data_";
 
   private SqlConnectorConfig _sqlConnectorConfig;
@@ -61,6 +77,8 @@ public abstract class SqlConnector {
   private SqlQueryConfig _sqlQueryConfig;
   private ResultSetParquetTransformer _resultSetParquetTransformer;
   private Path _tmpDataDir;
+  private Function<LocalDateTime, String> _dateTimeToDBFormatConverter;
+
 
   protected void setSqlConnectorConfig(SqlConnectorConfig sqlConnectorConfig) {
     _sqlConnectorConfig = sqlConnectorConfig;
@@ -78,13 +96,13 @@ public abstract class SqlConnector {
     _pinotControllerUrl = pinotControllerUrl;
   }
 
-  protected Statement getJDBCConnection(SqlConnectorConfig sqlConnectorConfig) throws SQLException {
+  protected Statement getJDBCConnection() throws SQLException {
     verifyDriverPresent();
 
     LOGGER.info("Creating JDBC connection");
     Connection connection =  DriverManager.getConnection(
-        sqlConnectorConfig.getConnectString(),
-        sqlConnectorConfig.getConnectProperties()
+        _sqlConnectorConfig.getConnectString(),
+        _sqlConnectorConfig.getConnectProperties()
     );
 
     LOGGER.info("Done creating JDBC connection");
@@ -95,60 +113,78 @@ public abstract class SqlConnector {
     Preconditions.checkArgument(_sqlConnectorConfig != null, "SqlConnectorConfig not set");
     Preconditions.checkArgument(_sqlQueryConfig != null, "SqlQueryConfig not set");
 
-    Statement statement = getJDBCConnection(_sqlConnectorConfig);
 
     _resultSetParquetTransformer = new ResultSetParquetTransformer();
     _tmpDataDir = Files.createTempDirectory(TMP_DIR_PREFIX);
+    _dateTimeToDBFormatConverter = getDateTimeToDatabaseFormatConverter();
 
+    Statement statement = getJDBCConnection();
     batchReadData(statement);
+    statement.close();
 
     buildAndPushSegments();
 
-    statement.close();
   }
 
   abstract void verifyDriverPresent() throws IllegalStateException;
 
   private void batchReadData(Statement statement) throws Exception {
-    DateTimeFormatter windowFormatter = new DateTimeFormatterBuilder()
-        .appendPattern(_sqlQueryConfig.getWindowDateTimeFormat())
-        .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
-        .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
-        .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
-        .toFormatter();
-
-    LocalDateTime windowStart = LocalDateTime.parse(_sqlQueryConfig.getStartTime(), windowFormatter);
-    LocalDateTime windowEnd = LocalDateTime.parse(_sqlQueryConfig.getEndTime(), windowFormatter);
+    LocalDateTime windowStart = _sqlQueryConfig.getWindowStartTime();
 
     // Get count(*) to determine total number of rows in each chunk
-    int numRows = getNumberOfRows(statement, windowStart, windowEnd);
+    long numRows = getNumberOfRows(statement, windowStart, _sqlQueryConfig.getWindowEndTime());
+
+
+
+    SqlNode sqlNode = SqlParser.create(_sqlQueryConfig.getQueryTemplate(), SqlParser.config()).parseQuery();
+    if (!sqlNode.isA(Set.of(SqlKind.SELECT))) {
+      throw new IllegalArgumentException("Invalid query. Must provide a SELECT sql statement");
+    }
+
+    SqlSelect sqlSelect = (SqlSelect) sqlNode;
+    SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere());
+
 
     LocalDateTime batchStart = windowStart;
-    LocalDateTime batchEnd = getNextGranularity(windowStart);
-    boolean isLastBatch = false;
+    LocalDateTime batchEnd = getNextBatchEnd(windowStart);
     int chunkNum = 1;
-    while (!isLastBatch) {
+    while (true) {
       //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
-
-      if (batchEnd.isAfter(windowEnd)) {
-        batchEnd = windowEnd;
-        isLastBatch = true;
-      }
+      /*
 
       String chunkQuery = _sqlQueryConfig.getQueryTemplate()
-          .replace("> $START", "> '" + convertDateTimeToDatabaseFormat(batchStart) + "'")
-          .replace("< $END", "<= '" + convertDateTimeToDatabaseFormat(batchEnd) + "'");
-
-      LOGGER.info("Chunk query: {}", chunkQuery);
+          .replace("> $START", "> '" + _dateTimeToDBFormatConverter.apply(batchStart) + "'")
+          .replace("< $END", "<= '" + _dateTimeToDBFormatConverter.apply(batchEnd) + "'");
+*/
+      String chunkQuery = replaceQueryStartAndEnd(sqlSelect, dateRangeNode,
+          _dateTimeToDBFormatConverter.apply(batchStart),
+          _dateTimeToDBFormatConverter.apply(batchEnd));
       queryAndSaveChunks(statement, chunkQuery, chunkNum);
 
+      if (batchEnd == _sqlQueryConfig.getWindowEndTime()) {
+        break;
+      }
+
       batchStart = batchEnd; //TODO needs to be incremented since between is inclusive
-      batchEnd = getNextGranularity(batchEnd);
+      batchEnd = getNextBatchEnd(batchEnd);
       chunkNum++;
     }
   }
 
-  private InputStream queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
+  private String replaceQueryStartAndEnd(SqlSelect sqlSelect, SqlBasicCall dateRangeNode, String startReplace,
+      String endReplace) {
+    ((SqlIdentifier) dateRangeNode.getOperands()[1])
+        .setNames(Collections.singletonList("'" + startReplace + "'"), null);
+    ((SqlIdentifier) dateRangeNode.getOperands()[2])
+        .setNames(Collections.singletonList("'" + endReplace + "'"), null);
+
+   String chunkQuery = sqlSelect.toSqlString(new SnowflakeSqlDialect(SnowflakeSqlDialect.EMPTY_CONTEXT))
+        .getSql().replace("ASYMMETRIC ", ""); //TODO fix THIS!!
+    LOGGER.info("New query with replaced dates is {}", chunkQuery);
+    return chunkQuery;
+  }
+
+  private void queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
     LOGGER.info("Executing query: {}", query);
     ResultSet resultSet = statement.executeQuery(query);
 
@@ -159,10 +195,13 @@ public abstract class SqlConnector {
       LOGGER.info("Column {} : type={}", colIdx, resultSetMetaData.getColumnTypeName(colIdx + 1));
     }
 
-    InputStream inputStream = _resultSetParquetTransformer
-        .transform(resultSet, "test" , "username" + "." + "database", _tmpDataDir, Integer.toString(chunkNum));
-
-    return inputStream;
+    _resultSetParquetTransformer.transform(
+        resultSet,
+        "test" ,
+        "username" + "." + "database",
+        _tmpDataDir,
+        Integer.toString(chunkNum)
+    );
   }
 
   private String convertDateTimeToDatabaseFormat(LocalDateTime dateTime) {
@@ -180,7 +219,30 @@ public abstract class SqlConnector {
     }
   }
 
-  private LocalDateTime getNextGranularity(LocalDateTime dateTime) {
+  private Function<LocalDateTime, String> getDateTimeToDatabaseFormatConverter() {
+    String timeColumnFormat = _sqlQueryConfig.getTimeColumnFormat();
+    switch (timeColumnFormat) {
+      case "millisecondsSinceEpoch":
+        return localDateTime -> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC) * 1000); //TODO which zone offset do we use
+      case "secondsSinceEpoch":
+        return localDateTime-> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC));
+      case "hoursSinceEpoch":
+        return localDateTime -> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC) / 60);
+      default:
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(timeColumnFormat);
+        return localDateTime -> localDateTime.format(formatter);
+    }
+  }
+
+  private LocalDateTime getNextBatchEnd(LocalDateTime dateTime) {
+    LocalDateTime nextDateTime = getNextDataPullDateTime(dateTime);
+    if (nextDateTime.isAfter(_sqlQueryConfig.getWindowEndTime())) {
+      nextDateTime = _sqlQueryConfig.getWindowEndTime();
+    }
+    return nextDateTime;
+  }
+
+  private LocalDateTime getNextDataPullDateTime(LocalDateTime dateTime) {
     long dataPullAmount = _sqlQueryConfig.getDataPullAmount();
     String dataPullGranularity = _sqlQueryConfig.getDataPullGranularity();
 
@@ -204,16 +266,78 @@ public abstract class SqlConnector {
     }
   }
 
-  private int getNumberOfRows(Statement statement, LocalDateTime dateTimeStart, LocalDateTime dateTimeEnd) throws SQLException {
-    // Generate count(*) query to get number of rows
-    Matcher matcher = COUNT_STAR_REGEX.matcher(_sqlQueryConfig.getQueryTemplate());
-    matcher.find();
-    String countQuery = matcher.group(1) + " COUNT(*) " + matcher.group(3);
+
+  @VisibleForTesting
+  protected long getTotalNumberOfRows(Statement statement) throws Exception {
+    return getNumberOfRows(statement, _sqlQueryConfig.getWindowStartTime(), _sqlQueryConfig.getWindowEndTime());
+  }
+
+  private SqlBasicCall findBetweenOperator(SqlNode sqlNode) {
+    if (sqlNode.getKind() == SqlKind.BETWEEN) {
+      SqlBasicCall betweenCall = (SqlBasicCall) sqlNode;
+      SqlNode columnName = betweenCall.getOperands()[0];
+      SqlNode left = betweenCall.getOperands()[1];
+      SqlNode right = betweenCall.getOperands()[2];
+
+      if (columnName.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) columnName).names.get(0).equals(_sqlQueryConfig.getTimeColumnName())
+          && left.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) left).names.get(0).equals(SqlQueryConfig.START)
+          && right.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) right).names.get(0).equals(SqlQueryConfig.END)) {
+        return betweenCall;
+      }
+    }
+
+    if (sqlNode instanceof SqlCall) {
+      for (SqlNode node : ((SqlBasicCall) sqlNode).getOperandList()) {
+        return findBetweenOperator(node);
+      }
+    }
+
+    throw new IllegalArgumentException("No between operator found!");
+  }
+
+  private long getNumberOfRows(Statement statement, LocalDateTime dateTimeStart, LocalDateTime dateTimeEnd)
+      throws Exception {
+    // Generate count(*) query to get number of rows)
+
+    SqlNode sqlNode = SqlParser.create(_sqlQueryConfig.getQueryTemplate(), SqlParser.config()).parseQuery();
+
+    if (!sqlNode.isA(Set.of(SqlKind.SELECT))) {
+      throw new IllegalArgumentException("Invalid query. Must provide a SELECT sql statement");
+    }
+
+    SqlSelect sqlSelect = (SqlSelect) sqlNode;
+    SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere());
+
+
+    //Set start and end identifiers
+    ((SqlIdentifier) dateRangeNode.getOperands()[1])
+        .setNames(Collections.singletonList("'" + convertDateTimeToDatabaseFormat(dateTimeStart) + "'"), null);
+    ((SqlIdentifier) dateRangeNode.getOperands()[2])
+        .setNames(Collections.singletonList("'" + convertDateTimeToDatabaseFormat(dateTimeEnd) + "'"), null);
+
+
+    // Just choose first column in select which is used to make a SELECT COUNT(XXX) query
+    SqlNode selectNodeFirst = sqlSelect.getSelectList().get(0);
+    SqlCall countCall = SqlStdOperatorTable.COUNT.createCall(SqlParserPos.ZERO, selectNodeFirst);
+    sqlSelect.setSelectList(SqlNodeList.of(countCall));
+
+    String countQueryWithTime = replaceQueryStartAndEnd(sqlSelect,
+        dateRangeNode,
+        convertDateTimeToDatabaseFormat(dateTimeStart),
+        convertDateTimeToDatabaseFormat(dateTimeEnd)
+    );
+
+    LOGGER.info("Making count query:" + countQueryWithTime);
+
+    /*
     String countQueryWithTimeRange = countQuery.replace("$START", "'" + convertDateTimeToDatabaseFormat(dateTimeStart) + "'")
         .replace("< $END", "<= '" + convertDateTimeToDatabaseFormat(dateTimeEnd) + "'");
-
-    LOGGER.info("Making query {}", countQueryWithTimeRange);
-    ResultSet resultSet = statement.executeQuery(countQueryWithTimeRange);
+*/
+    LOGGER.info("Making query {}", countQueryWithTime);
+    ResultSet resultSet = statement.executeQuery(countQueryWithTime);
 
     // fetch metadata
     ResultSetMetaData resultSetMetaData = resultSet.getMetaData();

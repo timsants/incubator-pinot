@@ -28,8 +28,9 @@
     </Console>
   </Appenders>
   <Loggers>
-    <AsyncRoot level="warn" additivity="false">
-      <AppenderRef ref="console" />
-    </AsyncRoot>
+    <Root level="info" additivity="false">
+      <AppenderRef ref="pinotLog"/>
+      <AppenderRef ref="console" level="info"/>
+    </Root>
   </Loggers>
 </Configuration>
