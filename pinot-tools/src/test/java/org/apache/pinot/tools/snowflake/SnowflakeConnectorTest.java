@@ -32,10 +32,10 @@ public class SnowflakeConnectorTest {
 
   private static final org.slf4j.Logger LOGGER = LoggerFactory.getLogger(SnowflakeConnectorTest.class);
 
-
   private File _testPinotTmpDir;
 
   private static final String PINOT_TABLE = "snowflakeTest";
+  private static final String CLUSTER_NAME = "testCluster";
 /*
   private static final String PINOT_CONTROLLER_HOST = "pinot87d28eda.itpinot76696eaf.192.168.64.176.nip.io";
   private static final String PINOT_CONTROLLER_PORT = "30000";
@@ -48,39 +48,36 @@ public class SnowflakeConnectorTest {
   private static final String SCHEMA_FILE = "snowflake/snowflakeTestSchema.json";
 
   @Test
-  public void endToEndTest() throws Exception {
-    startCluster("mycluster");
-    addTestTable();
+  public void testWithBatchConfig() throws Exception {
+    startPinotCluster();
+    createPinotTable();
 
     SqlConnectorConfig sqlConnectorConfig = new SnowflakeConfig(
-        "startree",//"timsants",
+        "startree",
         "egh9SMUD!thuc*toom",
-        "vka51661",//"xg65443.west-us-2.azure",
+        "vka51661",
         "SNOWFLAKE_SAMPLE_DATA",
         "TPCH_SF1",
         "ORDERS"
     );
     SqlQueryConfig sqlQueryConfig = new SqlQueryConfig(
         "SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERDATE FROM ORDERS WHERE "
-            + "O_ORDERDATE BETWEEN $START AND $END AND O_ORDERSTATUS = 'F'",
+            + "O_ORDERDATE BETWEEN $START AND $END",
         "yyyy-MM-dd",
-"O_ORDERDATE",
-        12,
-        "DAYS",
+        "O_ORDERDATE",
         "yyyy-MM-dd",
-        "1995-01-01",
-        "1995-01-20"
+        "1992-01-01",
+        "1999-01-01",
+        new SqlQueryConfig.BatchQueryConfig(3L, "YEARS")
     );
 
-    SnowflakeConnector connector =
-        new SnowflakeConnector(sqlConnectorConfig, sqlQueryConfig, PINOT_CONTROLLER_URL, PINOT_TABLE);
-    long numRowsInSnowflake = connector.getTotalNumberOfRows(connector.getJDBCConnection());
-
+    SnowflakeConnector connector = new SnowflakeConnector(sqlConnectorConfig, sqlQueryConfig, PINOT_CONTROLLER_URL, PINOT_TABLE);
     connector.execute();
 
     LOGGER.info("Waiting for documents to load...");
     Thread.sleep(10000);
 
+    long numRowsInSnowflake = connector.getTotalNumberOfRows(connector.getJDBCConnection());
     long numRowsInPinot = runPinotQuery("select count(*) from " + PINOT_TABLE)
         .get("resultTable").get("rows").get(0).get(0).asLong();
     assertEquals(numRowsInSnowflake, numRowsInPinot);
@@ -93,8 +90,55 @@ public class SnowflakeConnectorTest {
         Set.class);
     assertEquals(pinotColumns,
         Sets.newSet("o_custkey","o_orderdate","o_orderkey","o_orderstatus","o_totalprice"));
+  }
 
-    //Thread.sleep(600000);
+  @Test
+  public void testWithoutBatchConfig() throws Exception {
+    startPinotCluster();
+    createPinotTable();
+
+    SqlConnectorConfig sqlConnectorConfig = new SnowflakeConfig(
+        "startree",
+        "egh9SMUD!thuc*toom",
+        "vka51661",
+        "SNOWFLAKE_SAMPLE_DATA",
+        "TPCH_SF1",
+        "ORDERS"
+    );
+    SqlQueryConfig sqlQueryConfig = new SqlQueryConfig(
+        "SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERDATE FROM ORDERS WHERE "
+            + "O_ORDERDATE BETWEEN $START AND $END",
+        "yyyy-MM-dd",
+        "O_ORDERDATE",
+        "yyyy-MM-dd",
+        "1992-01-01",
+        "1999-01-01",
+        null
+    );
+
+    SnowflakeConnector connector = new SnowflakeConnector(sqlConnectorConfig, sqlQueryConfig, PINOT_CONTROLLER_URL, PINOT_TABLE);
+    connector.execute();
+
+    LOGGER.info("Waiting for documents to load...");
+    Thread.sleep(10000);
+
+    long numRowsInSnowflake = connector.getTotalNumberOfRows(connector.getJDBCConnection());
+    long numRowsInPinot = runPinotQuery("select count(*) from " + PINOT_TABLE)
+        .get("resultTable").get("rows").get(0).get(0).asLong();
+
+    //TODO use TestUtils.waitForCondition
+    assertEquals(numRowsInSnowflake, numRowsInPinot);
+
+    Set<String> pinotColumns = JsonUtils.jsonNodeToObject(
+        runPinotQuery("select * from " + PINOT_TABLE)
+            .get("resultTable")
+            .get("dataSchema")
+            .get("columnNames"),
+        Set.class);
+    assertEquals(pinotColumns,
+        Sets.newSet("o_custkey","o_orderdate","o_orderkey","o_orderstatus","o_totalprice"));
+
+    Thread.sleep(600000);
   }
 
   public JsonNode runPinotQuery(String query) throws Exception {
@@ -110,7 +154,7 @@ public class SnowflakeConnectorTest {
   /**
    * For testing only. Cluster should already be created when running tool.
    */
-  private void startCluster(String clusterName) throws Exception {
+  private void startPinotCluster() throws Exception {
     _testPinotTmpDir = new File(FileUtils.getTempDirectory(), String.valueOf(System.currentTimeMillis()));
 
     StartZookeeperCommand zkStarter = new StartZookeeperCommand();
@@ -118,29 +162,29 @@ public class SnowflakeConnectorTest {
     zkStarter.setDataDir(new File(_testPinotTmpDir, "PinotZkDir").getAbsolutePath());
     zkStarter.execute();
 
-    DeleteClusterCommand deleteClusterCommand = new DeleteClusterCommand().setClusterName(clusterName);
+    DeleteClusterCommand deleteClusterCommand = new DeleteClusterCommand().setClusterName(CLUSTER_NAME);
     deleteClusterCommand.execute();
 
     StartControllerCommand controllerStarter =
         new StartControllerCommand().setControllerPort("9000")
             .setZkAddress("localhost:2181")
-            .setClusterName(clusterName);
+            .setClusterName(CLUSTER_NAME);
 
     controllerStarter.execute();
 
     StartBrokerCommand brokerStarter =
-        new StartBrokerCommand().setClusterName(clusterName).setPort(Integer.valueOf("8000"));
+        new StartBrokerCommand().setClusterName(CLUSTER_NAME).setPort(Integer.valueOf("8000"));
     brokerStarter.execute();
 
     StartServerCommand serverStarter =
-        new StartServerCommand().setPort(Integer.valueOf("7000")).setClusterName(clusterName);
+        new StartServerCommand().setPort(Integer.valueOf("7000")).setClusterName(CLUSTER_NAME);
     serverStarter.execute();
   }
 
   /**
    * For testing only. Actual table should already be present when running connector.
    */
-  private void addTestTable() throws Exception {
+  private void createPinotTable() throws Exception {
     String tableConfigFile = getClass().getClassLoader().getResource(TABLE_CONFIG_FILE).getFile();
 
     String schemaFile = getClass().getClassLoader().getResource(SCHEMA_FILE).getFile();

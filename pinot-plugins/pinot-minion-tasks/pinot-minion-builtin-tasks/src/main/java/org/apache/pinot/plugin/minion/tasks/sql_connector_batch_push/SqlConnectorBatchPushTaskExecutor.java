@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-package org.apache.pinot.plugin.minion.tasks.segment_generation_and_push;
+package org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push;
 
 import java.io.File;
 import java.io.IOException;
@@ -89,8 +89,8 @@ import org.slf4j.LoggerFactory;
  *   push.segmentUriSuffix - Optional, segment download uri suffix, used when push.mode=uri
  *
  */
-public class SegmentGenerationAndPushTaskExecutor extends BaseTaskExecutor {
-  private static final Logger LOGGER = LoggerFactory.getLogger(SegmentGenerationAndPushTaskExecutor.class);
+public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
+  private static final Logger LOGGER = LoggerFactory.getLogger(SqlConnectorBatchPushTaskExecutor.class);
 
   private static final int DEFUALT_PUSH_ATTEMPTS = 5;
   private static final int DEFAULT_PUSH_PARALLELISM = 1;

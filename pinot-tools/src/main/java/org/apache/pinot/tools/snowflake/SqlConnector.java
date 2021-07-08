@@ -20,28 +20,23 @@ package org.apache.pinot.tools.snowflake;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import groovy.sql.Sql;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.sql.Array;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
-import java.util.List;
-import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
+import net.snowflake.client.jdbc.internal.threeten.bp.temporal.ChronoUnit;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -55,7 +50,6 @@ import org.apache.calcite.sql.dialect.SnowflakeSqlDialect;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.parser.SqlParser;
 import org.apache.calcite.sql.parser.SqlParserPos;
-import org.apache.calcite.sql.type.SqlTypeName;
 import org.apache.calcite.util.DateString;
 import org.apache.pinot.plugin.inputformat.parquet.ResultSetParquetTransformer;
 import org.apache.pinot.spi.ingestion.batch.IngestionJobLauncher;
@@ -66,8 +60,7 @@ import org.apache.pinot.spi.ingestion.batch.spec.PushJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.RecordReaderSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.SegmentGenerationJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.TableSpec;
-import org.apache.pinot.sql.parsers.CalciteSqlParser;
-import org.mortbay.util.SingletonList;
+import org.joda.time.Interval;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -76,6 +69,7 @@ public abstract class SqlConnector {
   private static final Logger LOGGER = LoggerFactory.getLogger(SqlConnector.class);
 
   private static final String TMP_DIR_PREFIX = "sql_connector_data_";
+  private static final long DEFAULT_BATCH_NUM_ROWS = 1000000;
 
   private SqlConnectorConfig _sqlConnectorConfig;
   private String _pinotTable;
@@ -85,6 +79,23 @@ public abstract class SqlConnector {
   private Path _tmpDataDir;
   private Function<LocalDateTime, String> _dateTimeToDBFormatConverter;
 
+
+  public void execute() throws Exception {
+    Preconditions.checkArgument(_sqlConnectorConfig != null, "SqlConnectorConfig not set");
+    Preconditions.checkArgument(_sqlQueryConfig != null, "SqlQueryConfig not set");
+
+    _resultSetParquetTransformer = new ResultSetParquetTransformer();
+    _tmpDataDir = Files.createTempDirectory(TMP_DIR_PREFIX);
+    _dateTimeToDBFormatConverter = getDateTimeToDatabaseFormatConverter();
+
+    Statement statement = getJDBCConnection();
+    batchReadData(statement);
+    statement.close();
+
+    buildAndPushSegments();
+  }
+
+  abstract void verifyDriverPresent() throws IllegalStateException;
 
   protected void setSqlConnectorConfig(SqlConnectorConfig sqlConnectorConfig) {
     _sqlConnectorConfig = sqlConnectorConfig;
@@ -115,31 +126,17 @@ public abstract class SqlConnector {
     return connection.createStatement();
   }
 
-  public void execute() throws Exception {
-    Preconditions.checkArgument(_sqlConnectorConfig != null, "SqlConnectorConfig not set");
-    Preconditions.checkArgument(_sqlQueryConfig != null, "SqlQueryConfig not set");
-
-
-    _resultSetParquetTransformer = new ResultSetParquetTransformer();
-    _tmpDataDir = Files.createTempDirectory(TMP_DIR_PREFIX);
-    _dateTimeToDBFormatConverter = getDateTimeToDatabaseFormatConverter();
-
-    Statement statement = getJDBCConnection();
-    batchReadData(statement);
-    statement.close();
-
-    buildAndPushSegments();
-
-  }
-
-  abstract void verifyDriverPresent() throws IllegalStateException;
-
   private void batchReadData(Statement statement) throws Exception {
-    LocalDateTime windowStart = _sqlQueryConfig.getWindowStartTime();
+    LocalDateTime windowStart = _sqlQueryConfig.getStartDateTime();
 
-    // Get count(*) to determine total number of rows in each chunk
-    long numRows = getNumberOfRows(statement, windowStart, _sqlQueryConfig.getWindowEndTime());
+    if (_sqlQueryConfig.getBatchQueryConfig() == null) {
+      // Determine batch sizes using the default number of rows per file
+      long numBatches = (long) Math.ceil((double) getNumberOfRows(statement, windowStart, _sqlQueryConfig.getEndDateTime()) / DEFAULT_BATCH_NUM_ROWS);
 
+      long batchPullAmount = Duration.between(_sqlQueryConfig.getStartDateTime(), _sqlQueryConfig.getEndDateTime()).toNanos() / numBatches;
+
+      _sqlQueryConfig.setBatchQueryConfig(new SqlQueryConfig.BatchQueryConfig(batchPullAmount, "NANOS")); //Use constant
+    }
 
 
     SqlNode sqlNode = SqlParser.create(_sqlQueryConfig.getQueryTemplate(), SqlParser.config()).parseQuery();
@@ -149,23 +146,21 @@ public abstract class SqlConnector {
 
     SqlSelect sqlSelect = (SqlSelect) sqlNode;
     SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere());
-
     SqlIdentifier timeColumn = (SqlIdentifier) dateRangeNode.getOperands()[0];
 
-
-
     LocalDateTime batchStart = windowStart;
-    LocalDateTime batchEnd = getNextBatchEnd(windowStart);
-    int chunkNum = 1;
+    LocalDateTime batchEnd;
+    int chunkNum = 0;
     boolean isLastChunk = false;
-    while (true) {
-      //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
-      /*
+    do {
+      chunkNum++;
+      batchEnd = getNextBatchEnd(batchStart);
 
-      String chunkQuery = _sqlQueryConfig.getQueryTemplate()
-          .replace(">= $START", "> '" + _dateTimeToDBFormatConverter.apply(batchStart) + "'")
-          .replace("< $END", "<= '" + _dateTimeToDBFormatConverter.apply(batchEnd) + "'");
-*/
+      if (batchEnd == _sqlQueryConfig.getEndDateTime()) {
+        isLastChunk = true;
+      }
+
+      //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
       String chunkQuery = replaceQueryStartAndEndBatch(
           sqlSelect,
           dateRangeNode,
@@ -175,19 +170,8 @@ public abstract class SqlConnector {
           isLastChunk);
       queryAndSaveChunks(statement, chunkQuery, chunkNum);
 
-      if (isLastChunk) {
-        break;
-      }
-
-      batchStart = batchEnd; //TODO needs to be incremented since between is inclusive
-      batchEnd = getNextBatchEnd(batchEnd);
-      chunkNum++;
-
-      if (batchEnd == _sqlQueryConfig.getWindowEndTime()) {
-        isLastChunk = true;
-        //handle truncating here instead of getNextBatch
-      }
-    }
+      batchStart = batchEnd;
+    } while (!isLastChunk);
   }
 
   private String replaceQueryStartAndEnd(SqlSelect sqlSelect, SqlBasicCall dateRangeNode, String startReplace,
@@ -222,7 +206,6 @@ public abstract class SqlConnector {
 
     SqlBasicCall ltEnd = new SqlBasicCall(ltOperator, endCalls, SqlParserPos.ZERO);
 
-
     dateRangeNode.setOperator(SqlStdOperatorTable.AND);
     dateRangeNode.setOperand(0, gtStart); //set start
     dateRangeNode.setOperand(1, ltEnd); //set end
@@ -231,8 +214,6 @@ public abstract class SqlConnector {
     LOGGER.info("New query with replaced dates is {}", chunkQuery);
     return chunkQuery;
   }
-
-
 
   private void queryAndSaveChunks(Statement statement, String query, int chunkNum) throws Exception {
     LOGGER.info("Executing query: {}", query);
@@ -286,40 +267,41 @@ public abstract class SqlConnector {
 
   private LocalDateTime getNextBatchEnd(LocalDateTime dateTime) {
     LocalDateTime nextDateTime = getNextDataPullDateTime(dateTime);
-    if (nextDateTime.isAfter(_sqlQueryConfig.getWindowEndTime())) {
-      nextDateTime = _sqlQueryConfig.getWindowEndTime();
+    if (nextDateTime.isAfter(_sqlQueryConfig.getEndDateTime())) {
+      nextDateTime = _sqlQueryConfig.getEndDateTime();
     }
     return nextDateTime;
   }
 
   private LocalDateTime getNextDataPullDateTime(LocalDateTime dateTime) {
-    long dataPullAmount = _sqlQueryConfig.getDataPullAmount();
-    String dataPullGranularity = _sqlQueryConfig.getDataPullGranularity();
+    long batchPullAmount = _sqlQueryConfig.getBatchQueryConfig().getBatchPullAmount();
+    String batchPullGranularity = _sqlQueryConfig.getBatchQueryConfig().getBatchGranularity();
 
-    switch (dataPullGranularity) {
+    switch (batchPullGranularity) {
+      case "NANOS":
+        return dateTime.plusNanos(batchPullAmount);
       case "SECONDS":
-        return dateTime.plusSeconds(dataPullAmount);
+        return dateTime.plusSeconds(batchPullAmount);
       case "MINUTES":
-        return dateTime.plusMinutes(dataPullAmount);
+        return dateTime.plusMinutes(batchPullAmount);
       case "HOURS":
-        return dateTime.plusHours(dataPullAmount);
+        return dateTime.plusHours(batchPullAmount);
       case "DAYS":
-        return dateTime.plusDays(dataPullAmount);
+        return dateTime.plusDays(batchPullAmount);
       case "WEEKS":
-        return dateTime.plusWeeks(dataPullAmount);
+        return dateTime.plusWeeks(batchPullAmount);
       case "MONTHS":
-        return dateTime.plusMonths(dataPullAmount);
+        return dateTime.plusMonths(batchPullAmount);
       case "YEARS":
-        return dateTime.plusYears(dataPullAmount);
+        return dateTime.plusYears(batchPullAmount);
       default:
-        throw new UnsupportedOperationException("Data pull granularity not support: " + dataPullGranularity);
+        throw new UnsupportedOperationException("Data pull granularity not support: " + batchPullGranularity);
     }
   }
 
-
   @VisibleForTesting
   protected long getTotalNumberOfRows(Statement statement) throws Exception {
-    return getNumberOfRows(statement, _sqlQueryConfig.getWindowStartTime(), _sqlQueryConfig.getWindowEndTime());
+    return getNumberOfRows(statement, _sqlQueryConfig.getStartDateTime(), _sqlQueryConfig.getEndDateTime());
   }
 
   private SqlBasicCall findBetweenOperator(SqlNode sqlNode) {
@@ -361,7 +343,6 @@ public abstract class SqlConnector {
     SqlSelect sqlSelect = (SqlSelect) sqlNode;
     SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere());
 
-
     //Set start and end identifiers
     ((SqlIdentifier) dateRangeNode.getOperands()[1])
         .setNames(Collections.singletonList("'" + convertDateTimeToDatabaseFormat(dateTimeStart) + "'"), null);
@@ -380,13 +361,7 @@ public abstract class SqlConnector {
         convertDateTimeToDatabaseFormat(dateTimeEnd)
     );
 
-    LOGGER.info("Making count query:" + countQueryWithTime);
-
-    /*
-    String countQueryWithTimeRange = countQuery.replace("$START", "'" + convertDateTimeToDatabaseFormat(dateTimeStart) + "'")
-        .replace("< $END", "<= '" + convertDateTimeToDatabaseFormat(dateTimeEnd) + "'");
-*/
-    LOGGER.info("Making query {}", countQueryWithTime);
+    LOGGER.info("Making count query {}", countQueryWithTime);
     ResultSet resultSet = statement.executeQuery(countQueryWithTime);
 
     // fetch metadata

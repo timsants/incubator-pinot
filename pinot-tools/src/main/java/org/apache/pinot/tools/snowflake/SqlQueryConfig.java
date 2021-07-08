@@ -1,10 +1,11 @@
 package org.apache.pinot.tools.snowflake;
 
-import com.google.common.base.Preconditions;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
 import java.time.temporal.ChronoField;
+import javax.annotation.Nullable;
+import net.snowflake.client.jdbc.internal.google.api.gax.rpc.Batch;
 
 
 /**
@@ -18,43 +19,50 @@ public class SqlQueryConfig {
   private String _queryTemplate;
   private String _timeColumnFormat; //format of time column expressed as date format. other accepted values are millisecondsSinceEpoch and secondsSinceEpoch.
   private String _timeColumnName;
-  private long _dataPullAmount; //? do we need this
-  private String _dataPullGranularity; //how big each chunk should be SECONDS, MINUTES, HOURS, DAYS
 
-  private String _windowDateTimeFormat = "yyyy-MM-dd"; //optional; Format of startTime and endTime
+  private String _startEndDateTimeFormat = "yyyy-MM-dd"; //optional; Format of startTime and endTime
   private String _startTime; //string ISO format or could add format...
   private String _endTime;
 
-  private LocalDateTime _windowStartTime;
-  private LocalDateTime _windowEndTime;
+  private LocalDateTime _startDateTime;
+  private LocalDateTime _endDateTime;
+
+  private BatchQueryConfig _batchQueryConfig;
 
   public static final String START = "$START";
   public static final String END = "$END";
 
 
-  public SqlQueryConfig(String queryTemplate, String timeColumnFormat, String timeColumnName, long dataPullAmount,
-      String dataPullGranularity, String windowDateTimeFormat, String startTime, String endTime) {
+  public SqlQueryConfig(String queryTemplate,
+      String timeColumnFormat,
+      String timeColumnName,
+      String startEndDateTimeFormat,
+      String startTime,
+      String endTime,
+      @Nullable BatchQueryConfig batchQueryConfig) {
     _queryTemplate = queryTemplate;
     _timeColumnFormat = timeColumnFormat;
     _timeColumnName = timeColumnName;
-    _dataPullAmount = dataPullAmount;
-    _dataPullGranularity = dataPullGranularity;
-    _windowDateTimeFormat = windowDateTimeFormat;
+    _startEndDateTimeFormat = startEndDateTimeFormat;
     _startTime = startTime;
     _endTime = endTime;
-
+    _batchQueryConfig = batchQueryConfig;
 
     validate();
 
     DateTimeFormatter windowFormatter = new DateTimeFormatterBuilder()
-        .appendPattern(_windowDateTimeFormat)
+        .appendPattern(_startEndDateTimeFormat)
         .parseDefaulting(ChronoField.HOUR_OF_DAY, 0)
         .parseDefaulting(ChronoField.MINUTE_OF_HOUR, 0)
         .parseDefaulting(ChronoField.SECOND_OF_MINUTE, 0)
         .toFormatter();
 
-    _windowStartTime = LocalDateTime.parse(_startTime, windowFormatter);
-    _windowEndTime = LocalDateTime.parse(_endTime, windowFormatter);
+    _startDateTime = LocalDateTime.parse(_startTime, windowFormatter);
+    _endDateTime = LocalDateTime.parse(_endTime, windowFormatter);
+  }
+
+  public void setBatchQueryConfig(BatchQueryConfig batchQueryConfig) {
+    _batchQueryConfig = batchQueryConfig;
   }
 
   private void validate() throws IllegalStateException {
@@ -77,35 +85,41 @@ public class SqlQueryConfig {
     return _timeColumnFormat;
   }
 
-  public long getDataPullAmount() {
-    return _dataPullAmount;
+  public String getStartEndDateTimeFormat() {
+    return _startEndDateTimeFormat;
   }
 
-  public String getWindowDateTimeFormat() {
-    return _windowDateTimeFormat;
+  public LocalDateTime getStartDateTime() {
+    return _startDateTime;
   }
 
-  public String getStartTime() {
-    return _startTime;
-  }
-
-  public String getEndTime() {
-    return _endTime;
-  }
-
-  public String getDataPullGranularity() {
-    return _dataPullGranularity;
-  }
-
-  public LocalDateTime getWindowStartTime() {
-    return _windowStartTime;
-  }
-
-  public LocalDateTime getWindowEndTime() {
-    return _windowEndTime;
+  public LocalDateTime getEndDateTime() {
+    return _endDateTime;
   }
 
   public String getTimeColumnName() {
     return _timeColumnName;
+  }
+
+  public BatchQueryConfig getBatchQueryConfig() {
+    return _batchQueryConfig;
+  }
+
+  public static class BatchQueryConfig {
+    private long _batchPullAmount;
+    private String _batchGranularity;
+
+    public BatchQueryConfig(long batchPullAmount, String batchGranularity) {
+      _batchPullAmount = batchPullAmount;
+      _batchGranularity = batchGranularity;
+    }
+
+    public long getBatchPullAmount() {
+      return _batchPullAmount;
+    }
+
+    public String getBatchGranularity() {
+      return _batchGranularity;
+    }
   }
 }
