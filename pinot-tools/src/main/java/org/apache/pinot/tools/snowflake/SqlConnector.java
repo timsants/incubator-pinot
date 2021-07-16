@@ -34,9 +34,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
-import net.snowflake.client.jdbc.internal.threeten.bp.temporal.ChronoUnit;
 import org.apache.calcite.sql.SqlBasicCall;
 import org.apache.calcite.sql.SqlCall;
 import org.apache.calcite.sql.SqlIdentifier;
@@ -60,7 +58,6 @@ import org.apache.pinot.spi.ingestion.batch.spec.PushJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.RecordReaderSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.SegmentGenerationJobSpec;
 import org.apache.pinot.spi.ingestion.batch.spec.TableSpec;
-import org.joda.time.Interval;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -117,7 +114,7 @@ public abstract class SqlConnector {
     verifyDriverPresent();
 
     LOGGER.info("Creating JDBC connection");
-    Connection connection =  DriverManager.getConnection(
+    Connection connection = DriverManager.getConnection(
         _sqlConnectorConfig.getConnectString(),
         _sqlConnectorConfig.getConnectProperties()
     );
@@ -274,8 +271,8 @@ public abstract class SqlConnector {
   }
 
   private LocalDateTime getNextDataPullDateTime(LocalDateTime dateTime) {
-    long batchPullAmount = _sqlQueryConfig.getBatchQueryConfig().getBatchPullAmount();
-    String batchPullGranularity = _sqlQueryConfig.getBatchQueryConfig().getBatchGranularity();
+    long batchPullAmount = _sqlQueryConfig.getBatchQueryConfig().getPullAmount();
+    String batchPullGranularity = _sqlQueryConfig.getBatchQueryConfig().getPullGranularity();
 
     switch (batchPullGranularity) {
       case "NANOS":

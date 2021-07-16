@@ -1,4 +1,4 @@
-package org.apache.pinot.tools.snowflake;
+package org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;

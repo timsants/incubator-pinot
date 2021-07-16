@@ -3,10 +3,16 @@ package org.apache.pinot.tools.snowflake;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.io.File;
 import java.util.Set;
+import java.util.UUID;
 import org.apache.commons.io.FileUtils;
+import org.apache.pinot.common.utils.ZkStarter;
 import org.apache.pinot.controller.helix.ControllerRequestURLBuilder;
+import org.apache.pinot.minion.MinionContext;
+import org.apache.pinot.minion.MinionStarter;
+import org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push.SqlConnectorBatchPushTaskExecutor;
 import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableType;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.CommonConstants;
 import org.apache.pinot.spi.utils.JsonUtils;
 import org.apache.pinot.spi.utils.builder.TableConfigBuilder;
@@ -15,6 +21,7 @@ import org.apache.pinot.tools.admin.command.DeleteClusterCommand;
 import org.apache.pinot.tools.admin.command.PostQueryCommand;
 import org.apache.pinot.tools.admin.command.StartBrokerCommand;
 import org.apache.pinot.tools.admin.command.StartControllerCommand;
+import org.apache.pinot.tools.admin.command.StartMinionCommand;
 import org.apache.pinot.tools.admin.command.StartServerCommand;
 import org.apache.pinot.tools.admin.command.StartZookeeperCommand;
 import org.mockito.internal.util.collections.Sets;
@@ -96,7 +103,11 @@ public class SnowflakeConnectorTest {
   public void testWithoutBatchConfig() throws Exception {
     startPinotCluster();
     createPinotTable();
-
+    SqlConnectorBatchPushTaskExecutor executor = new SqlConnectorBatchPushTaskExecutor();
+    File localTempDir = new File(new File(MinionContext.getInstance().getDataDir(), "SegmentGenerationAndPushResult"),
+        "tmp-" + UUID.randomUUID());
+    //executor.generateTaskSpec(localTempDir);
+    /*
     SqlConnectorConfig sqlConnectorConfig = new SnowflakeConfig(
         "startree",
         "egh9SMUD!thuc*toom",
@@ -137,7 +148,7 @@ public class SnowflakeConnectorTest {
         Set.class);
     assertEquals(pinotColumns,
         Sets.newSet("o_custkey","o_orderdate","o_orderkey","o_orderstatus","o_totalprice"));
-
+*/
     Thread.sleep(600000);
   }
 
@@ -150,6 +161,11 @@ public class SnowflakeConnectorTest {
             .run()
     );
   }
+
+  protected String getHelixClusterName() {
+    return getClass().getSimpleName();
+  }
+
 
   /**
    * For testing only. Cluster should already be created when running tool.
@@ -179,6 +195,22 @@ public class SnowflakeConnectorTest {
     StartServerCommand serverStarter =
         new StartServerCommand().setPort(Integer.valueOf("7000")).setClusterName(CLUSTER_NAME);
     serverStarter.execute();
+
+    //start minion
+    StartMinionCommand minionStarter = new StartMinionCommand();
+    minionStarter.execute();
+    /*
+    FileUtils.deleteQuietly(new File(CommonConstants.Minion.DEFAULT_INSTANCE_BASE_DIR));
+    try {
+      PinotConfiguration minionConf = new PinotConfiguration();
+      minionConf.setProperty(CommonConstants.Helix.CONFIG_OF_CLUSTER_NAME, getHelixClusterName());
+      minionConf.setProperty(CommonConstants.Helix.CONFIG_OF_ZOOKEEPR_SERVER, zookeeperInstance.getZkUrl());
+      MinionStarter minionStarter = new MinionStarter();
+      minionStarter.init(minionConf);
+      minionStarter.start();
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }*/
   }
 
   /**

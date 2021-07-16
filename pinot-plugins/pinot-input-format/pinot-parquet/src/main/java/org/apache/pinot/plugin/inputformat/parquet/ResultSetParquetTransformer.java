@@ -43,7 +43,7 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName;
  */
 public class ResultSetParquetTransformer {
 
-  public InputStream transform(ResultSet resultSet, String schemaName, String namespace, java.nio.file.Path tempDir, String chunkNum) throws IOException, SQLException {
+  public File transform(ResultSet resultSet, String schemaName, String namespace, java.nio.file.Path tempDir, String chunkNum) throws IOException, SQLException {
 
     SchemaResults schemaResults = new ResultSetSchemaGenerator().generateSchema(resultSet,
         schemaName, namespace);
@@ -63,7 +63,6 @@ public class ResultSetParquetTransformer {
         .withCompressionCodec(CompressionCodecName.SNAPPY)
         .build();
 
-    List<GenericRecord> records = new ArrayList<>();
 
     while (resultSet.next()) {
 
@@ -78,19 +77,12 @@ public class ResultSetParquetTransformer {
 
       GenericRecord record = builder.build();
 
-      records.add(record);
-    }
-
-    for (GenericRecord record : records) {
       parquetWriter.write(record);
     }
 
     parquetWriter.close();
 
-    File outputFile = localFileSystem.pathToFile(outputPath);
-
-    return new FileInputStream(outputFile);
-
+    return localFileSystem.pathToFile(outputPath);
   }
 
   /**

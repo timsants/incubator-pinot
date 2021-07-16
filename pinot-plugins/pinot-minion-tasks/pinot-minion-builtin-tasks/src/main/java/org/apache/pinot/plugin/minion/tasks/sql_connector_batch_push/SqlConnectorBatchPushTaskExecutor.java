@@ -21,6 +21,9 @@ package org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -33,6 +36,7 @@ import org.apache.pinot.common.utils.TarGzCompressionUtils;
 import org.apache.pinot.core.minion.PinotTaskConfig;
 import org.apache.pinot.minion.MinionContext;
 import org.apache.pinot.plugin.ingestion.batch.common.SegmentGenerationTaskRunner;
+import org.apache.pinot.plugin.inputformat.parquet.ResultSetParquetTransformer;
 import org.apache.pinot.plugin.minion.tasks.BaseTaskExecutor;
 import org.apache.pinot.plugin.minion.tasks.SegmentConversionResult;
 import org.apache.pinot.segment.local.utils.SegmentPushUtils;
@@ -104,11 +108,10 @@ public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
 
   @Override
   public Object executeTask(PinotTaskConfig pinotTaskConfig) throws Exception {
-    LOGGER.info("Executing SegmentGenerationAndPushTask with task config: {}", pinotTaskConfig);
+    LOGGER.error("Executing SqlConnectorBatchPushTask with task config: {}", pinotTaskConfig);
     Map<String, String> taskConfigs = pinotTaskConfig.getConfigs();
     SegmentGenerationAndPushResult.Builder resultBuilder = new SegmentGenerationAndPushResult.Builder();
-    File localTempDir = new File(new File(MinionContext.getInstance().getDataDir(), "SegmentGenerationAndPushResult"),
-        "tmp-" + UUID.randomUUID());
+    File localTempDir = new File(MinionContext.getInstance().getDataDir(), "tmp-sqlConnectorData-" + UUID.randomUUID());
 
     try {
       // Generate Pinot Segment
@@ -200,6 +203,7 @@ public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
 
     PinotClusterSpec pinotClusterSpec = new PinotClusterSpec();
     pinotClusterSpec.setControllerURI(taskConfigs.get(BatchConfigProperties.PUSH_CONTROLLER_URI));
+
     PinotClusterSpec[] pinotClusterSpecs = new PinotClusterSpec[]{pinotClusterSpec};
 
     SegmentGenerationJobSpec spec = new SegmentGenerationJobSpec();
@@ -241,12 +245,44 @@ public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
     return localSegmentTarFile;
   }
 
-  private SegmentGenerationTaskSpec generateTaskSpec(Map<String, String> taskConfigs, File localTempDir)
+  private File queryAndSaveToFile(Statement statement, String query, File localTempDir) throws Exception {
+    LOGGER.info("Executing query: {}", query);
+    ResultSet resultSet = statement.executeQuery(query);
+
+    ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
+    LOGGER.info("Number of columns = {}", resultSetMetaData.getColumnCount());
+
+    for (int colIdx = 0; colIdx < resultSetMetaData.getColumnCount(); colIdx++) {
+      LOGGER.info("Column {} : type={}", colIdx, resultSetMetaData.getColumnTypeName(colIdx + 1));
+    }
+
+
+    ResultSetParquetTransformer transformer = new ResultSetParquetTransformer();
+
+    return transformer.transform(
+        resultSet,
+        "test" ,
+        "username" + "." + "database",
+        localTempDir.toPath(),
+        "DUMMY"
+    );
+  }
+
+  //Visible only for testing
+  public SegmentGenerationTaskSpec generateTaskSpec(Map<String, String> taskConfigs, File localTempDir)
       throws Exception {
     SegmentGenerationTaskSpec taskSpec = new SegmentGenerationTaskSpec();
-    URI inputFileURI = URI.create(taskConfigs.get(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY));
-    // This is where file is pulled from data source
-    PinotFS inputFileFS = SegmentGenerationAndPushTaskUtils.getInputPinotFS(taskConfigs, inputFileURI);
+
+    String sqlQuery = taskConfigs.get(StartreeMinionConstants.TASK_QUERY);
+
+    // Make query to DB
+    Statement statement = SnowflakeConnectorPlugin.getJDBCConnection(
+        taskConfigs.get(StartreeMinionConstants.PROPERTIES_USERNAME),
+        taskConfigs.get(StartreeMinionConstants.PROPERTIES_PASSWORD),
+        taskConfigs.get(StartreeMinionConstants.PROPERTIES_ACCOUNT),
+        taskConfigs.get(StartreeMinionConstants.PROPERTIES_DB),
+        taskConfigs.get(StartreeMinionConstants.PROPERTIES_SCHEMA)
+    );
 
     File localInputTempDir = new File(localTempDir, "input");
     FileUtils.forceMkdir(localInputTempDir);
@@ -254,15 +290,16 @@ public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
     FileUtils.forceMkdir(localOutputTempDir);
     taskSpec.setOutputDirectoryPath(localOutputTempDir.getAbsolutePath());
 
-    //copy input path to local
-    File localInputDataFile = new File(localInputTempDir, new File(inputFileURI.getPath()).getName());
-    inputFileFS.copyToLocalFile(inputFileURI, localInputDataFile);
-    taskSpec.setInputFilePath(localInputDataFile.getAbsolutePath());
+
+    queryAndSaveToFile(statement, sqlQuery, localInputTempDir);
+
+    // Save to local
+    taskSpec.setInputFilePath(localInputTempDir.getAbsolutePath());
 
     RecordReaderSpec recordReaderSpec = new RecordReaderSpec();
-    recordReaderSpec.setDataFormat(taskConfigs.get(BatchConfigProperties.INPUT_FORMAT));
-    recordReaderSpec.setClassName(taskConfigs.get(BatchConfigProperties.RECORD_READER_CLASS));
-    recordReaderSpec.setConfigClassName(taskConfigs.get(BatchConfigProperties.RECORD_READER_CONFIG_CLASS));
+    recordReaderSpec.setDataFormat("parquet");
+    recordReaderSpec.setClassName("org.apache.pinot.plugin.inputformat.parquet.ParquetRecordReader");
+    //do i need config class?
     taskSpec.setRecordReaderSpec(recordReaderSpec);
 
     String authToken = taskConfigs.get(BatchConfigProperties.AUTH_TOKEN); // TODO
@@ -298,7 +335,7 @@ public class SqlConnectorBatchPushTaskExecutor extends BaseTaskExecutor {
     segmentNameGeneratorSpec.setConfigs(IngestionConfigUtils
         .getConfigMapWithPrefix(taskConfigs, BatchConfigProperties.SEGMENT_NAME_GENERATOR_PROP_PREFIX));
     taskSpec.setSegmentNameGeneratorSpec(segmentNameGeneratorSpec);
-    taskSpec.setCustomProperty(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY, inputFileURI.toString());
+    taskSpec.setCustomProperty(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY, localInputTempDir.toURI().toString());
     return taskSpec;
   }
 }

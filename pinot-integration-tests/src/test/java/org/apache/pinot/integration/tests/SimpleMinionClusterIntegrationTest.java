@@ -86,7 +86,9 @@ public class SimpleMinionClusterIntegrationTest extends ClusterTest {
   }
 
   @Test
-  public void testStopResumeDeleteTaskQueue() {
+  public void testStopResumeDeleteTaskQueue() throws Exception {
+
+    Thread.sleep(600000);
     // Hold the task
     HOLD.set(true);
 

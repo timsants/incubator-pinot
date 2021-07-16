@@ -19,12 +19,13 @@
 package org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push;
 
 import com.google.common.base.Preconditions;
-import java.io.IOException;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.file.FileSystems;
-import java.nio.file.PathMatcher;
-import java.nio.file.Paths;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.Statement;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -32,10 +33,24 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
+import org.apache.calcite.sql.SqlBasicCall;
+import org.apache.calcite.sql.SqlCall;
+import org.apache.calcite.sql.SqlIdentifier;
+import org.apache.calcite.sql.SqlKind;
+import org.apache.calcite.sql.SqlLiteral;
+import org.apache.calcite.sql.SqlNode;
+import org.apache.calcite.sql.SqlNodeList;
+import org.apache.calcite.sql.SqlOperator;
+import org.apache.calcite.sql.SqlSelect;
+import org.apache.calcite.sql.dialect.SnowflakeSqlDialect;
+import org.apache.calcite.sql.fun.SqlStdOperatorTable;
+import org.apache.calcite.sql.parser.SqlParser;
+import org.apache.calcite.sql.parser.SqlParserPos;
+import org.apache.calcite.util.DateString;
 import org.apache.helix.task.JobConfig;
 import org.apache.helix.task.TaskState;
 import org.apache.pinot.common.metadata.segment.OfflineSegmentZKMetadata;
-import org.apache.pinot.common.segment.generation.SegmentGenerationUtils;
 import org.apache.pinot.controller.helix.core.minion.ClusterInfoAccessor;
 import org.apache.pinot.controller.helix.core.minion.generator.PinotTaskGenerator;
 import org.apache.pinot.core.common.MinionConstants;
@@ -45,13 +60,14 @@ import org.apache.pinot.spi.config.table.TableConfig;
 import org.apache.pinot.spi.config.table.TableTaskConfig;
 import org.apache.pinot.spi.config.table.TableType;
 import org.apache.pinot.spi.config.table.ingestion.BatchIngestionConfig;
-import org.apache.pinot.spi.filesystem.PinotFS;
 import org.apache.pinot.spi.ingestion.batch.BatchConfigProperties;
-import org.apache.pinot.spi.plugin.PluginManager;
 import org.apache.pinot.spi.utils.IngestionConfigUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import static org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push.SnowflakeConnectorPlugin.getJDBCConnection;
+import static org.apache.pinot.plugin.minion.tasks.sql_connector_batch_push.StartreeMinionConstants.STARTREE_MINION_TASK;
 
 
 /**
@@ -92,6 +108,8 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
 
   private ClusterInfoAccessor _clusterInfoAccessor;
 
+  private static final long DEFAULT_BATCH_NUM_ROWS = 1000000;
+
   @Override
   public void init(ClusterInfoAccessor clusterInfoAccessor) {
     _clusterInfoAccessor = clusterInfoAccessor;
@@ -99,7 +117,7 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
 
   @Override
   public String getTaskType() {
-    return MinionConstants.SegmentGenerationAndPushTask.TASK_TYPE;
+    return STARTREE_MINION_TASK;
   }
 
   @Override
@@ -132,7 +150,7 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
       TableTaskConfig tableTaskConfig = tableConfig.getTaskConfig();
       Preconditions.checkNotNull(tableTaskConfig);
       Map<String, String> taskConfigs =
-          tableTaskConfig.getConfigsForTaskType(MinionConstants.SegmentGenerationAndPushTask.TASK_TYPE);
+          tableTaskConfig.getConfigsForTaskType(STARTREE_MINION_TASK);
       Preconditions.checkNotNull(taskConfigs, "Task config shouldn't be null for Table: {}", offlineTableName);
 
       // Get max number of tasks for this table
@@ -159,12 +177,14 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
       BatchIngestionConfig batchIngestionConfig = tableConfig.getIngestionConfig().getBatchIngestionConfig();
       List<Map<String, String>> batchConfigMaps = batchIngestionConfig.getBatchConfigMaps();
       for (Map<String, String> batchConfigMap : batchConfigMaps) {
+        // TODO filter to only use sql connector batch configs
         try {
-          URI inputDirURI = SegmentGenerationUtils.getDirectoryURI(batchConfigMap.get(BatchConfigProperties.INPUT_DIR_URI));
-          updateRecordReaderConfigs(batchConfigMap);
           List<OfflineSegmentZKMetadata> offlineSegmentsMetadata = Collections.emptyList();
-          // For append mode, we don't create segments for input file URIs already created.
-          if (BatchConfigProperties.SegmentIngestionType.APPEND.name().equalsIgnoreCase(batchSegmentIngestionType)) {
+
+          /*
+          LOGIC for determining if task is already in progress or segments that have already been pushed
+
+           if (BatchConfigProperties.SegmentIngestionType.APPEND.name().equalsIgnoreCase(batchSegmentIngestionType)) {
             offlineSegmentsMetadata = this._clusterInfoAccessor.getOfflineSegmentsMetadata(offlineTableName);
           }
           Set<String> existingSegmentInputFiles = getExistingSegmentInputFiles(offlineSegmentsMetadata);
@@ -174,13 +194,38 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
                   + "and exclude input files from existing segments metadata: {}, "
                   + "and input files from running tasks: {}", inputDirURI, existingSegmentInputFiles,
               inputFilesFromRunningTasks);
-          List<URI> inputFileURIs = getInputFilesFromDirectory(batchConfigMap, inputDirURI, existingSegmentInputFiles);
-          LOGGER.info("Final input files for task config generation: {}", inputFileURIs);
-          for (URI inputFileURI : inputFileURIs) {
+           */
+          // For append mode, we don't create segments for input file URIs already created.
+
+          //List<URI> inputFileURIs = getInputFilesFromDirectory(batchConfigMap, inputDirURI, existingSegmentInputFiles);
+
+          //HARDCODE for testing
+          SqlConnectorConfig sqlConnectorConfig = new SnowflakeConfig(
+              "startree",
+              "egh9SMUD!thuc*toom",
+              "vka51661",
+              "SNOWFLAKE_SAMPLE_DATA",
+              "TPCH_SF1",
+              "ORDERS"
+          );
+          SqlQueryConfig sqlQueryConfig = new SqlQueryConfig(
+              "SELECT O_ORDERKEY, O_CUSTKEY, O_ORDERSTATUS, O_TOTALPRICE, O_ORDERDATE FROM ORDERS WHERE "
+                  + "O_ORDERDATE BETWEEN $START AND $END",
+              "yyyy-MM-dd",
+              "O_ORDERDATE",
+              "yyyy-MM-dd",
+              "1992-01-01",
+              "1999-01-01",
+              new SqlQueryConfig.BatchQueryConfig(3L, "YEARS")
+          );
+          // end of hard code
+
+          List<String> smallQueryChunks = getSmallQueryChunks(sqlQueryConfig, sqlConnectorConfig);
+          LOGGER.info("Chunk queries for task config generation: {}", smallQueryChunks);
+          for (String smallQueryChunk : smallQueryChunks) {
             Map<String, String> singleFileGenerationTaskConfig =
-                getSingleFileGenerationTaskConfig(offlineTableName, tableNumTasks, batchConfigMap, inputFileURI);
-            pinotTaskConfigs.add(new PinotTaskConfig(MinionConstants.SegmentGenerationAndPushTask.TASK_TYPE,
-                singleFileGenerationTaskConfig));
+                getSingleFileGenerationTaskConfig(offlineTableName, tableNumTasks, smallQueryChunk, batchConfigMap);
+            pinotTaskConfigs.add(new PinotTaskConfig(STARTREE_MINION_TASK, singleFileGenerationTaskConfig));
             tableNumTasks++;
 
             // Generate up to tableMaxNumTasks tasks each time for each table
@@ -195,6 +240,258 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
       }
     }
     return pinotTaskConfigs;
+  }
+
+  private LocalDateTime getNextDataPullDateTime(LocalDateTime dateTime, long pullAmount, String pullGranularity) {
+    switch (pullGranularity) {
+      case "NANOS":
+        return dateTime.plusNanos(pullAmount);
+      case "SECONDS":
+        return dateTime.plusSeconds(pullAmount);
+      case "MINUTES":
+        return dateTime.plusMinutes(pullAmount);
+      case "HOURS":
+        return dateTime.plusHours(pullAmount);
+      case "DAYS":
+        return dateTime.plusDays(pullAmount);
+      case "WEEKS":
+        return dateTime.plusWeeks(pullAmount);
+      case "MONTHS":
+        return dateTime.plusMonths(pullAmount);
+      case "YEARS":
+        return dateTime.plusYears(pullAmount);
+      default:
+        throw new UnsupportedOperationException("Data pull granularity not support: " + pullGranularity);
+    }
+  }
+
+  private LocalDateTime getNextBatchEnd(LocalDateTime dateTime, LocalDateTime endDateTime, long pullAmount, String pullGranularity) {
+    LocalDateTime nextDateTime = getNextDataPullDateTime(dateTime, pullAmount, pullGranularity);
+    if (nextDateTime.isAfter(endDateTime)) {
+      nextDateTime = endDateTime;
+    }
+    return nextDateTime;
+  }
+
+  private List<String> getSmallQueryChunks(SqlQueryConfig queryConfig, SqlConnectorConfig sqlConnectorConfig) throws Exception {
+    LocalDateTime windowStart = queryConfig.getStartDateTime();
+
+    if (queryConfig.getBatchQueryConfig() == null) {
+      // Determine batch sizes using the default number of rows per file
+      long numBatches = (long) Math.ceil((double) getNumberOfRows(sqlConnectorConfig, windowStart, queryConfig.getEndDateTime(), queryConfig.getQueryTemplate(), queryConfig.getTimeColumnName(), queryConfig.getTimeColumnFormat()) / DEFAULT_BATCH_NUM_ROWS);
+
+      long batchPullAmount = Duration.between(queryConfig.getStartDateTime(), queryConfig.getEndDateTime()).toNanos() / numBatches;
+
+      queryConfig.setBatchQueryConfig(new SqlQueryConfig.BatchQueryConfig(batchPullAmount, "NANOS")); //Use constant
+    }
+
+
+    SqlNode sqlNode = SqlParser.create(queryConfig.getQueryTemplate(), SqlParser.config()).parseQuery();
+    if (!sqlNode.isA(Set.of(SqlKind.SELECT))) {
+      throw new IllegalArgumentException("Invalid query. Must provide a SELECT sql statement");
+    }
+
+    SqlSelect sqlSelect = (SqlSelect) sqlNode;
+    SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere(), queryConfig.getTimeColumnName());
+    SqlIdentifier timeColumn = (SqlIdentifier) dateRangeNode.getOperands()[0];
+
+    LocalDateTime batchStart = windowStart;
+    LocalDateTime batchEnd;
+    boolean isLastChunk = false;
+    List<String> chunkQueries = new ArrayList<>();
+
+    Function<LocalDateTime, String> dateTimeToDBFormatConverter = getDateTimeToDatabaseFormatConverter(
+        queryConfig.getTimeColumnFormat());
+
+    do {
+      batchEnd = getNextBatchEnd(batchStart, queryConfig.getEndDateTime(),
+          queryConfig.getBatchQueryConfig().getPullAmount(),
+          queryConfig.getBatchQueryConfig().getPullGranularity()
+      );
+
+      if (batchEnd == queryConfig.getEndDateTime()) {
+        isLastChunk = true;
+      }
+
+      //TODO: can make dynamic. if we can pull more rows if we need to. make another count(*) recursively.
+      String chunkQuery = replaceQueryStartAndEndBatch(
+          sqlSelect,
+          dateRangeNode,
+          timeColumn,
+          dateTimeToDBFormatConverter.apply(batchStart),
+          dateTimeToDBFormatConverter.apply(batchEnd),
+          isLastChunk);
+      chunkQueries.add(chunkQuery);
+      batchStart = batchEnd;
+    } while (!isLastChunk);
+
+    return chunkQueries;
+  }
+
+  /**
+   * Move to db query util
+   * @param sqlConnectorConfig
+   * @param dateTimeStart
+   * @param dateTimeEnd
+   * @return
+   * @throws Exception
+   */
+  private long getNumberOfRows(SqlConnectorConfig sqlConnectorConfig, LocalDateTime dateTimeStart, LocalDateTime dateTimeEnd, String sqlQueryTemplate, String timeColumnName, String timeColumnFormat)
+      throws Exception {
+    // Generate count(*) query to get number of rows)
+
+    //TODO fix this. do not store into properties object anymore
+    Statement statement = getJDBCConnection(
+        sqlConnectorConfig.getConnectProperties().getProperty("user"),
+        sqlConnectorConfig.getConnectProperties().getProperty("password"),
+        sqlConnectorConfig.getConnectProperties().getProperty("account"),
+        sqlConnectorConfig.getConnectProperties().getProperty("db"),
+        sqlConnectorConfig.getConnectProperties().getProperty("schema")
+    );
+
+    SqlNode sqlNode = SqlParser.create(sqlQueryTemplate, SqlParser.config()).parseQuery();
+
+    if (!sqlNode.isA(Set.of(SqlKind.SELECT))) {
+      throw new IllegalArgumentException("Invalid query. Must provide a SELECT sql statement");
+    }
+
+    SqlSelect sqlSelect = (SqlSelect) sqlNode;
+    SqlBasicCall dateRangeNode = findBetweenOperator(sqlSelect.getWhere(), timeColumnName);
+
+    //Set start and end identifiers
+    ((SqlIdentifier) dateRangeNode.getOperands()[1])
+        .setNames(Collections.singletonList("'" + convertDateTimeToDatabaseFormat(dateTimeStart, timeColumnFormat) + "'"), null);
+    ((SqlIdentifier) dateRangeNode.getOperands()[2])
+        .setNames(Collections.singletonList("'" + convertDateTimeToDatabaseFormat(dateTimeEnd, timeColumnFormat) + "'"), null);
+
+
+    // Just choose first column in select which is used to make a SELECT COUNT(XXX) query
+    SqlNode selectNodeFirst = sqlSelect.getSelectList().get(0);
+    SqlCall countCall = SqlStdOperatorTable.COUNT.createCall(SqlParserPos.ZERO, selectNodeFirst);
+    sqlSelect.setSelectList(SqlNodeList.of(countCall));
+
+    String countQueryWithTime = replaceQueryStartAndEnd(sqlSelect,
+        dateRangeNode,
+        convertDateTimeToDatabaseFormat(dateTimeStart, timeColumnFormat),
+        convertDateTimeToDatabaseFormat(dateTimeEnd, timeColumnFormat)
+    );
+
+    LOGGER.info("Making count query {}", countQueryWithTime);
+    ResultSet resultSet = statement.executeQuery(countQueryWithTime);
+
+    // fetch metadata
+    ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
+
+    if (resultSetMetaData.getColumnCount() != 1) {
+      throw new IllegalStateException("Expected 1 column in result set. Instead got " + resultSetMetaData.getColumnCount());
+    }
+
+    // fetch data
+    resultSet.next();
+    int rowCount = resultSet.getInt( 1);
+
+    LOGGER.info("There are {} number of rows in the time range {} to {}", rowCount, dateTimeStart.toString(), dateTimeEnd.toString());
+
+    return rowCount;
+  }
+
+  private String replaceQueryStartAndEnd(SqlSelect sqlSelect, SqlBasicCall dateRangeNode, String startReplace,
+      String endReplace) {
+    ((SqlIdentifier) dateRangeNode.getOperands()[1])
+        .setNames(Collections.singletonList("'" + startReplace + "'"), null);
+    ((SqlIdentifier) dateRangeNode.getOperands()[2])
+        .setNames(Collections.singletonList("'" + endReplace + "'"), null);
+
+    String chunkQuery = sqlSelect.toSqlString(new SnowflakeSqlDialect(SnowflakeSqlDialect.EMPTY_CONTEXT))
+        .getSql().replace("ASYMMETRIC ", ""); //TODO fix THIS!!
+    LOGGER.info("New query with replaced dates is {}", chunkQuery);
+    return chunkQuery;
+  }
+
+  private String convertDateTimeToDatabaseFormat(LocalDateTime dateTime, String timeColumnFormat) {
+    switch (timeColumnFormat) {
+      case "millisecondsSinceEpoch":
+        return Long.toString(dateTime.toEpochSecond(ZoneOffset.UTC) * 1000); //TODO which zone offset do we use
+      case "secondsSinceEpoch":
+        return Long.toString(dateTime.toEpochSecond(ZoneOffset.UTC));
+      case "hoursSinceEpoch":
+        return Long.toString(dateTime.toEpochSecond(ZoneOffset.UTC) / 60);
+      default:
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(timeColumnFormat);
+        return dateTime.format(formatter);
+    }
+  }
+
+  private String replaceQueryStartAndEndBatch(SqlSelect sqlSelect, SqlBasicCall dateRangeNode, SqlIdentifier timeColumn, String startReplace,
+      String endReplace, boolean isLastChunk) {
+
+    SqlNode[] startCalls = new SqlNode[2];
+    SqlLiteral startTime = SqlLiteral.createDate(new DateString(startReplace), SqlParserPos.ZERO);
+    startCalls[0] = timeColumn;
+    startCalls[1] = startTime;
+    SqlBasicCall gtStart = new SqlBasicCall(SqlStdOperatorTable.GREATER_THAN_OR_EQUAL, startCalls, SqlParserPos.ZERO);
+
+    SqlNode[] endCalls = new SqlNode[2];
+    SqlLiteral endTime = SqlLiteral.createDate(new DateString(endReplace), SqlParserPos.ZERO);
+    endCalls[0] = timeColumn;
+    endCalls[1] = endTime;
+
+    SqlOperator ltOperator = isLastChunk ? SqlStdOperatorTable.LESS_THAN_OR_EQUAL : SqlStdOperatorTable.LESS_THAN;
+
+    SqlBasicCall ltEnd = new SqlBasicCall(ltOperator, endCalls, SqlParserPos.ZERO);
+
+    dateRangeNode.setOperator(SqlStdOperatorTable.AND);
+    dateRangeNode.setOperand(0, gtStart); //set start
+    dateRangeNode.setOperand(1, ltEnd); //set end
+
+    String chunkQuery = sqlSelect.toSqlString(new SnowflakeSqlDialect(SnowflakeSqlDialect.EMPTY_CONTEXT)).getSql();
+    LOGGER.info("New query with replaced dates is {}", chunkQuery);
+    return chunkQuery;
+  }
+
+  private Function<LocalDateTime, String> getDateTimeToDatabaseFormatConverter(String timeColumnFormat) {
+    switch (timeColumnFormat) {
+      case "millisecondsSinceEpoch":
+        return localDateTime -> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC) * 1000); //TODO which zone offset do we use
+      case "secondsSinceEpoch":
+        return localDateTime-> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC));
+      case "hoursSinceEpoch":
+        return localDateTime -> Long.toString(localDateTime.toEpochSecond(ZoneOffset.UTC) / 60);
+      default:
+        DateTimeFormatter formatter = DateTimeFormatter.ofPattern(timeColumnFormat);
+        return localDateTime -> localDateTime.format(formatter);
+    }
+  }
+
+  /**
+   * Put in SQL utils
+   * @param sqlNode
+   * @return
+   */
+  private SqlBasicCall findBetweenOperator(SqlNode sqlNode, String timeColumnName) {
+    if (sqlNode.getKind() == SqlKind.BETWEEN) {
+      SqlBasicCall betweenCall = (SqlBasicCall) sqlNode;
+      SqlNode columnName = betweenCall.getOperands()[0];
+      SqlNode left = betweenCall.getOperands()[1];
+      SqlNode right = betweenCall.getOperands()[2];
+
+      if (columnName.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) columnName).names.get(0).equals(timeColumnName)
+          && left.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) left).names.get(0).equals(SqlQueryConfig.START)
+          && right.getKind() == SqlKind.IDENTIFIER
+          && ((SqlIdentifier) right).names.get(0).equals(SqlQueryConfig.END)) {
+        return betweenCall;
+      }
+    }
+
+    if (sqlNode instanceof SqlBasicCall) {
+      for (SqlNode node : ((SqlBasicCall) sqlNode).getOperandList()) {
+        return findBetweenOperator(node, timeColumnName);
+      }
+    }
+
+    throw new IllegalArgumentException("No between operator found!");
   }
 
   private Set<String> getInputFilesFromRunningTasks() {
@@ -222,115 +519,14 @@ public class SqlConnectorBatchPushTaskGenerator implements PinotTaskGenerator {
     return inputFilesFromRunningTasks;
   }
 
-  private Map<String, String> getSingleFileGenerationTaskConfig(String offlineTableName, int sequenceID,
-      Map<String, String> batchConfigMap, URI inputFileURI)
-      throws URISyntaxException {
-
-    URI inputDirURI = SegmentGenerationUtils.getDirectoryURI(batchConfigMap.get(BatchConfigProperties.INPUT_DIR_URI));
-    URI outputDirURI = null;
-    if (batchConfigMap.containsKey(BatchConfigProperties.OUTPUT_DIR_URI)) {
-      outputDirURI = SegmentGenerationUtils.getDirectoryURI(batchConfigMap.get(BatchConfigProperties.OUTPUT_DIR_URI));
-    }
-    String pushMode = IngestionConfigUtils.getPushMode(batchConfigMap);
-
+  private Map<String, String> getSingleFileGenerationTaskConfig(String offlineTableName, int sequenceID, String sqlQuery, Map<String, String> batchConfigMap) {
     Map<String, String> singleFileGenerationTaskConfig = new HashMap<>(batchConfigMap);
     singleFileGenerationTaskConfig
         .put(BatchConfigProperties.TABLE_NAME, TableNameBuilder.OFFLINE.tableNameWithType(offlineTableName));
-    singleFileGenerationTaskConfig.put(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY, inputFileURI.toString());
-    if (outputDirURI != null) {
-      URI outputSegmentDirURI = SegmentGenerationUtils.getRelativeOutputPath(inputDirURI, inputFileURI, outputDirURI);
-      singleFileGenerationTaskConfig.put(BatchConfigProperties.OUTPUT_SEGMENT_DIR_URI, outputSegmentDirURI.toString());
-    }
+    singleFileGenerationTaskConfig.put(StartreeMinionConstants.TASK_QUERY, sqlQuery);
     singleFileGenerationTaskConfig.put(BatchConfigProperties.SEQUENCE_ID, String.valueOf(sequenceID));
-    singleFileGenerationTaskConfig
-        .put(BatchConfigProperties.SEGMENT_NAME_GENERATOR_TYPE, BatchConfigProperties.SegmentNameGeneratorType.SIMPLE);
-    if ((outputDirURI == null) || (pushMode == null)) {
-      singleFileGenerationTaskConfig.put(BatchConfigProperties.PUSH_MODE, DEFAULT_SEGMENT_PUSH_TYPE.toString());
-    } else {
-      singleFileGenerationTaskConfig.put(BatchConfigProperties.PUSH_MODE, pushMode);
-    }
     singleFileGenerationTaskConfig.put(BatchConfigProperties.PUSH_CONTROLLER_URI, _clusterInfoAccessor.getVipUrl());
+
     return singleFileGenerationTaskConfig;
-  }
-
-  private void updateRecordReaderConfigs(Map<String, String> batchConfigMap) {
-    String inputFormat = batchConfigMap.get(BatchConfigProperties.INPUT_FORMAT);
-    String recordReaderClassName = PluginManager.get().getRecordReaderClassName(inputFormat);
-    if (recordReaderClassName != null) {
-      batchConfigMap.putIfAbsent(BatchConfigProperties.RECORD_READER_CLASS, recordReaderClassName);
-    }
-    String recordReaderConfigClassName = PluginManager.get().getRecordReaderConfigClassName(inputFormat);
-    if (recordReaderConfigClassName != null) {
-      batchConfigMap.putIfAbsent(BatchConfigProperties.RECORD_READER_CONFIG_CLASS, recordReaderConfigClassName);
-    }
-  }
-
-  private List<URI> getInputFilesFromDirectory(Map<String, String> batchConfigMap, URI inputDirURI,
-      Set<String> existingSegmentInputFileURIs)
-      throws Exception {
-    PinotFS inputDirFS = SegmentGenerationAndPushTaskUtils.getInputPinotFS(batchConfigMap, inputDirURI);
-
-    String includeFileNamePattern = batchConfigMap.get(BatchConfigProperties.INCLUDE_FILE_NAME_PATTERN);
-    String excludeFileNamePattern = batchConfigMap.get(BatchConfigProperties.EXCLUDE_FILE_NAME_PATTERN);
-
-    //Get list of files to process
-    String[] files;
-    try {
-      files = inputDirFS.listFiles(inputDirURI, true);
-    } catch (IOException e) {
-      LOGGER.error("Unable to list files under URI: " + inputDirURI, e);
-      return Collections.emptyList();
-    }
-    PathMatcher includeFilePathMatcher = null;
-    if (includeFileNamePattern != null) {
-      includeFilePathMatcher = FileSystems.getDefault().getPathMatcher(includeFileNamePattern);
-    }
-    PathMatcher excludeFilePathMatcher = null;
-    if (excludeFileNamePattern != null) {
-      excludeFilePathMatcher = FileSystems.getDefault().getPathMatcher(excludeFileNamePattern);
-    }
-    List<URI> inputFileURIs = new ArrayList<>();
-    for (String file : files) {
-      LOGGER.debug("Processing file: {}", file);
-      if (includeFilePathMatcher != null) {
-        if (!includeFilePathMatcher.matches(Paths.get(file))) {
-          LOGGER.debug("Exclude file {} as it's not matching includeFilePathMatcher: {}", file, includeFileNamePattern);
-          continue;
-        }
-      }
-      if (excludeFilePathMatcher != null) {
-        if (excludeFilePathMatcher.matches(Paths.get(file))) {
-          LOGGER.debug("Exclude file {} as it's matching excludeFilePathMatcher: {}", file, excludeFileNamePattern);
-          continue;
-        }
-      }
-      try {
-        URI inputFileURI = SegmentGenerationUtils.getFileURI(file, inputDirURI);
-        if (existingSegmentInputFileURIs.contains(inputFileURI.toString())) {
-          LOGGER.debug("Skipping already processed inputFileURI: {}", inputFileURI);
-          continue;
-        }
-        if (inputDirFS.isDirectory(inputFileURI)) {
-          LOGGER.debug("Skipping directory: {}", inputFileURI);
-          continue;
-        }
-        inputFileURIs.add(inputFileURI);
-      } catch (Exception e) {
-        LOGGER.error("Failed to construct inputFileURI for path: {}, parent directory URI: {}", file, inputDirURI, e);
-        continue;
-      }
-    }
-    return inputFileURIs;
-  }
-
-  private Set<String> getExistingSegmentInputFiles(List<OfflineSegmentZKMetadata> offlineSegmentsMetadata) {
-    Set<String> existingSegmentInputFiles = new HashSet<>();
-    for (OfflineSegmentZKMetadata metadata : offlineSegmentsMetadata) {
-      if ((metadata.getCustomMap() != null) && metadata.getCustomMap()
-          .containsKey(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY)) {
-        existingSegmentInputFiles.add(metadata.getCustomMap().get(BatchConfigProperties.INPUT_DATA_FILE_URI_KEY));
-      }
-    }
-    return existingSegmentInputFiles;
   }
 }

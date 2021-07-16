@@ -32,7 +32,8 @@
           "timeColumnName": "O_ORDERDATE",
           "startEndTimeFormat": "yyyy-MM-dd",
           "startTime": "1992-01-01",
-          "endTime": "1999-01-01"
+          "endTime": "1999-01-01",
+          "push.mode": "tar"
         }
       ],
       "segmentNameSpec": {},
